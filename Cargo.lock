@@ -1917,6 +1917,7 @@ version = "0.0.0-source"
 name = "noted-desktop"
 version = "0.0.0-source"
 dependencies = [
+ "serde",
  "tauri",
  "tauri-build",
 ]
