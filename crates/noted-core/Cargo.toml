@@ -1,0 +1,11 @@
+[package]
+name = "noted-core"
+version = "0.0.0-source"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "noted_core"
+path = "src/lib.rs"
+

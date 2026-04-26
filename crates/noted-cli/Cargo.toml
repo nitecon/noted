@@ -1,0 +1,14 @@
+[package]
+name = "noted"
+version = "0.0.0-source"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "noted"
+path = "src/main.rs"
+
+[dependencies]
+noted-core = { path = "../noted-core" }
+
