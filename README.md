@@ -7,6 +7,9 @@ while making notes easy to search, outline, extract, and edit from AI agents.
 ## Current CLI
 
 ```bash
+cargo run -p noted -- .
+cargo run -p noted -- config set-vault /path/to/vault
+cargo run -p noted -- config show
 cargo run -p noted -- index /path/to/vault
 cargo run -p noted -- index /path/to/vault --rebuild
 cargo run -p noted -- search "query" /path/to/vault
@@ -18,6 +21,11 @@ cargo run -p noted -- section /path/to/note.md "Heading"
 
 The CLI and future desktop app share `noted-core`, so parsing and search
 behavior stays consistent across both surfaces.
+
+`noted <path>` resolves a vault path and refreshes `.noted/index/manifest.tsv`.
+When no path is provided, Noted reads the configured vault from
+`~/.noted/config.yml` on macOS/Linux or `%USERPROFILE%\.noted\config.yml` on
+Windows.
 
 ## Desktop App
 

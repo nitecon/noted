@@ -1,5 +1,6 @@
 use noted_core::{
-    PersistentIndex, SearchMode, SearchOptions, parse_markdown, search_vault, section_by_heading,
+    NotedConfig, PersistentIndex, SearchMode, SearchOptions, config_path, parse_markdown,
+    search_vault, section_by_heading,
 };
 use std::env;
 use std::fs;
@@ -17,14 +18,35 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     match args.first().map(String::as_str) {
         Some("search") => search_command(&args[1..]),
         Some("index") => index_command(&args[1..]),
+        Some("config") => config_command(&args[1..]),
         Some("outline") => outline_command(&args[1..]),
         Some("section") => section_command(&args[1..]),
-        Some("help") | Some("--help") | Some("-h") | None => {
+        Some("help") | Some("--help") | Some("-h") => {
             print_help();
             Ok(())
         }
-        Some(command) => Err(format!("unknown command: {command}").into()),
+        Some(path) if !path.starts_with('-') => open_vault_command(Some(path)),
+        None => open_vault_command(None),
+        Some(command) => Err(format!("unknown option: {command}").into()),
     }
+}
+
+fn open_vault_command(path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let config = NotedConfig::load()?;
+    let vault = config.resolve_vault(path)?;
+    let update = PersistentIndex::refresh(&vault)?;
+    let stats = update.index.stats();
+
+    println!("vault: {}", vault.display());
+    println!("index: {}", update.manifest_path.display());
+    println!("documents: {}", stats.documents);
+    println!(
+        "scan: {} files, {} reused, {} updated, {} removed",
+        update.scanned, update.reused, update.updated, update.removed
+    );
+    println!("desktop: launch integration pending; use `cd apps/noted-desktop && npm run dev`");
+
+    Ok(())
 }
 
 fn search_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -147,6 +169,41 @@ fn index_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn config_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    match args.first().map(String::as_str) {
+        Some("set-vault") => {
+            let path = args.get(1).ok_or("usage: noted config set-vault <path>")?;
+            let mut config = NotedConfig::load()?;
+            let vault = if PathBuf::from(path).is_absolute() {
+                PathBuf::from(path)
+            } else {
+                env::current_dir()?.join(path)
+            };
+            config.vault = Some(vault.clone());
+            let path = config.save()?;
+
+            println!("config: {}", path.display());
+            println!("vault: {}", vault.display());
+            Ok(())
+        }
+        Some("path") => {
+            println!("{}", config_path()?.display());
+            Ok(())
+        }
+        Some("show") | None => {
+            let config = NotedConfig::load()?;
+            println!("config: {}", config_path()?.display());
+            if let Some(vault) = config.vault {
+                println!("vault: {}", vault.display());
+            } else {
+                println!("vault: (not configured)");
+            }
+            Ok(())
+        }
+        Some(command) => Err(format!("unknown config command: {command}").into()),
+    }
+}
+
 fn outline_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let path = args
         .first()
@@ -180,6 +237,6 @@ fn section_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn print_help() {
     println!(
-        "noted\n\nUSAGE:\n  noted index [vault] [--refresh|--rebuild]\n  noted search <query> [vault] [--limit n] [--mode bm25|vector]\n  noted outline <note.md>\n  noted section <note.md> <heading>"
+        "noted\n\nUSAGE:\n  noted [vault]\n  noted config show\n  noted config set-vault <path>\n  noted index [vault] [--refresh|--rebuild]\n  noted search <query> [vault] [--limit n] [--mode bm25|vector]\n  noted outline <note.md>\n  noted section <note.md> <heading>"
     );
 }
