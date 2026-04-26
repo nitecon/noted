@@ -235,6 +235,36 @@ fn paste_vault_path(source_path: String, target_folder: String) -> Result<TreePa
     Ok(tree_path(&root, &target))
 }
 
+#[tauri::command]
+fn read_vault_file(relative_path: String) -> Result<FileContentState, String> {
+    let root = configured_vault()?;
+    let path = resolve_existing_vault_path(&root, &relative_path)?;
+    if !path.is_file() {
+        return Err(format!("{relative_path} is not a file"));
+    }
+
+    let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    Ok(FileContentState {
+        path: relative_display(&root, &path),
+        content,
+    })
+}
+
+#[tauri::command]
+fn write_vault_file(relative_path: String, content: String) -> Result<FileWriteState, String> {
+    let root = configured_vault()?;
+    let path = resolve_existing_vault_path(&root, &relative_path)?;
+    if !path.is_file() {
+        return Err(format!("{relative_path} is not a file"));
+    }
+
+    fs::write(&path, content.as_bytes()).map_err(|error| error.to_string())?;
+    Ok(FileWriteState {
+        path: relative_display(&root, &path),
+        bytes: content.len(),
+    })
+}
+
 #[derive(serde::Serialize)]
 struct AgentCommand {
     command: String,
@@ -282,6 +312,20 @@ struct TreePath {
     path: String,
     kind: String,
     item_type: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileContentState {
+    path: String,
+    content: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileWriteState {
+    path: String,
+    bytes: usize,
 }
 
 fn command_exists(command: &str) -> bool {
@@ -564,7 +608,9 @@ pub fn run() {
             create_vault_folder,
             rename_vault_path,
             duplicate_vault_path,
-            paste_vault_path
+            paste_vault_path,
+            read_vault_file,
+            write_vault_file
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Noted desktop application");

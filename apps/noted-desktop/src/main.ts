@@ -1,5 +1,20 @@
 import {invoke} from "@tauri-apps/api/core";
 import {open} from "@tauri-apps/plugin-dialog";
+import {defaultKeymap, history, historyKeymap} from "@codemirror/commands";
+import {markdown} from "@codemirror/lang-markdown";
+import {defaultHighlightStyle, syntaxHighlighting} from "@codemirror/language";
+import {EditorState, RangeSetBuilder, StateEffect, type Extension} from "@codemirror/state";
+import {
+  Decoration,
+  EditorView,
+  keymap,
+  ViewPlugin,
+  WidgetType,
+  type DecorationSet,
+  type PluginValue,
+  type ViewUpdate,
+} from "@codemirror/view";
+import MarkdownIt from "markdown-it";
 import "./styles.css";
 
 type FileNode = {
@@ -45,6 +60,11 @@ type VaultOpenState = {
   removed: number;
 };
 
+type FileContentState = {
+  path: string;
+  content: string;
+};
+
 type DirectoryPickerHandle = {
   name: string;
 };
@@ -74,6 +94,15 @@ type PendingMove = {
   sourcePath: string;
   targetFolderPath: string;
 };
+
+const idleRenderDelayMs = 20_000;
+
+const md = new MarkdownIt({
+  breaks: true,
+  html: false,
+  linkify: true,
+  typographer: true,
+});
 
 let folders: FolderNode[] = [
   {
@@ -153,6 +182,13 @@ let tabMenu: TabMenuTarget | null = null;
 let draggedTreeItem: {kind: "folder" | "file"; path: string} | null = null;
 let pendingMove: PendingMove | null = null;
 let copiedTreePath: {kind: "folder" | "file"; path: string} | null = null;
+let editorView: EditorView | null = null;
+const noteTexts = new Map<string, string>();
+const loadedFiles = new Set<string>();
+const loadingFiles = new Set<string>();
+const dirtyFiles = new Set<string>();
+const saveTimers = new Map<string, number>();
+let suppressNextSave = false;
 const notedVersion = "0.0.0-source";
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -172,6 +208,7 @@ function activeAgent() {
 }
 
 function render() {
+  persistEditorText();
   const agent = activeAgent();
 
   root.innerHTML = `
@@ -216,7 +253,7 @@ function render() {
           </div>
           <div>
             <span>Index</span>
-            <strong>${indexSummary}</strong>
+            <strong id="index-summary">${indexSummary}</strong>
           </div>
         </footer>
       </aside>
@@ -237,17 +274,8 @@ function render() {
           </div>
         </header>
 
-        <div class="editor-shell">
-          <textarea aria-label="Editor placeholder" spellcheck="true"># ${
-            activeFile.split("/").at(-1)?.replace(/\.md$/, "") ?? "Untitled"
-          }
-
-Noted keeps Markdown files as the first-class surface while still allowing quick code/file review when the modifier key is held over the vault tree.
-
-- Folder rows expand to show notes immediately.
-- Hold ${navigator.platform.includes("Mac") ? "Command" : "Control"} while hovering the tree to reveal non-Markdown files.
-- Agent context mode controls whether this note is attached to each request.
-          </textarea>
+        <div class="editor-shell" aria-label="Markdown live preview editor">
+          <div id="editor"></div>
         </div>
       </section>
 
@@ -294,6 +322,8 @@ Noted keeps Markdown files as the first-class surface while still allowing quick
   `;
 
   bindEvents();
+  mountEditor();
+  void loadActiveFile();
 }
 
 function renderVoiceMenu() {
@@ -355,6 +385,170 @@ function renderMoveDialog() {
       </div>
     </div>
   `;
+}
+
+class MarkdownLineWidget extends WidgetType {
+  constructor(
+    private readonly source: string,
+    private readonly lineNumber: number,
+  ) {
+    super();
+  }
+
+  eq(other: MarkdownLineWidget) {
+    return other.source === this.source && other.lineNumber === this.lineNumber;
+  }
+
+  toDOM() {
+    const wrapper = document.createElement("span");
+    wrapper.className = `cm-live-render ${lineKindClass(this.source)}`;
+    wrapper.dataset.line = String(this.lineNumber);
+
+    const content = document.createElement("span");
+    content.className = "cm-live-render__content";
+    content.innerHTML = renderLine(this.source);
+    wrapper.append(content);
+
+    return wrapper;
+  }
+
+  ignoreEvent() {
+    return false;
+  }
+}
+
+class LivePreviewPlugin implements PluginValue {
+  decorations: DecorationSet;
+  private idleTimer: number | undefined;
+
+  constructor(private readonly view: EditorView) {
+    this.decorations = buildLivePreviewDecorations(view);
+    this.scheduleIdleRefresh();
+  }
+
+  update(update: ViewUpdate) {
+    if (update.docChanged || update.selectionSet || update.viewportChanged || update.focusChanged) {
+      this.decorations = buildLivePreviewDecorations(update.view);
+      this.scheduleIdleRefresh();
+    }
+  }
+
+  destroy() {
+    if (this.idleTimer !== undefined) {
+      window.clearTimeout(this.idleTimer);
+    }
+  }
+
+  private scheduleIdleRefresh() {
+    if (this.idleTimer !== undefined) {
+      window.clearTimeout(this.idleTimer);
+    }
+
+    this.idleTimer = window.setTimeout(() => {
+      this.decorations = buildLivePreviewDecorations(this.view);
+      this.view.dispatch({effects: forceDecorationRefresh.of(null)});
+      this.scheduleIdleRefresh();
+    }, idleRenderDelayMs);
+  }
+}
+
+const forceDecorationRefresh = StateEffect.define<null>();
+
+function livePreview(): Extension {
+  return ViewPlugin.fromClass(LivePreviewPlugin, {
+    decorations: (plugin) => plugin.decorations,
+  });
+}
+
+function renderLine(source: string) {
+  const trimmed = source.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  const task = source.match(/^(\s*)[-*+]\s+\[([ xX])]\s+(.*)$/);
+  if (task) {
+    const checked = task[2].toLowerCase() === "x";
+    return `<label class="task-line"><input type="checkbox" disabled ${
+      checked ? "checked" : ""
+    } /> <span>${md.renderInline(task[3])}</span></label>`;
+  }
+
+  const heading = source.match(/^(#{1,6})\s+(.*)$/);
+  if (heading) {
+    const level = heading[1].length;
+    return `<span class="heading heading-${level}">${md.renderInline(heading[2])}</span>`;
+  }
+
+  const quote = source.match(/^>\s?(.*)$/);
+  if (quote) {
+    return `<span class="quote-line">${md.renderInline(quote[1])}</span>`;
+  }
+
+  const list = source.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+  if (list) {
+    return `<span class="list-line"><span class="list-line__marker">${list[2]}</span>${md.renderInline(
+      list[3],
+    )}</span>`;
+  }
+
+  const fence = source.match(/^```(.*)$/);
+  if (fence) {
+    return `<code class="fence-line">\`\`\`${escapeHtml(fence[1])}</code>`;
+  }
+
+  return md.renderInline(source);
+}
+
+function lineKindClass(source: string) {
+  if (/^#{1,6}\s+/.test(source)) return "cm-live-render--heading";
+  if (/^>\s?/.test(source)) return "cm-live-render--quote";
+  if (/^\s*[-*+]\s+\[[ xX]\]\s+/.test(source)) return "cm-live-render--task";
+  if (/^\s*([-*+]|\d+[.)])\s+/.test(source)) return "cm-live-render--list";
+  if (/^```/.test(source)) return "cm-live-render--fence";
+  return "cm-live-render--paragraph";
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function buildLivePreviewDecorations(view: EditorView) {
+  const activeLines = new Set<number>();
+  for (const range of view.state.selection.ranges) {
+    const startLine = view.state.doc.lineAt(range.from).number;
+    const endLine = view.state.doc.lineAt(range.to).number;
+    for (let lineNumber = startLine; lineNumber <= endLine; lineNumber += 1) {
+      activeLines.add(lineNumber);
+    }
+  }
+
+  const builder = new RangeSetBuilder<Decoration>();
+  for (const {from, to} of view.visibleRanges) {
+    let pos = from;
+    while (pos <= to) {
+      const line = view.state.doc.lineAt(pos);
+      if (!activeLines.has(line.number) && line.text.trim().length > 0) {
+        builder.add(
+          line.from,
+          line.to,
+          Decoration.replace({
+            widget: new MarkdownLineWidget(line.text, line.number),
+            inclusive: false,
+          }),
+        );
+      }
+
+      if (line.to >= to || line.to === view.state.doc.length) break;
+      pos = line.to + 1;
+    }
+  }
+
+  return builder.finish();
 }
 
 function treeMenuItems(target: TreeMenuTarget) {
@@ -803,12 +997,161 @@ function bindEvents() {
 }
 
 function selectedEditorText() {
-  const editor = document.querySelector<HTMLTextAreaElement>(".editor-shell textarea");
-  if (!editor || editor.selectionStart === editor.selectionEnd) {
+  if (!editorView) {
     return "";
   }
 
-  return editor.value.slice(editor.selectionStart, editor.selectionEnd).trim();
+  return editorView.state.selection.ranges
+    .map((range) => editorView?.state.doc.sliceString(range.from, range.to) ?? "")
+    .join("\n")
+    .trim();
+}
+
+function persistEditorText() {
+  if (editorView && activeFile) {
+    noteTexts.set(activeFile, editorView.state.doc.toString());
+    editorView.destroy();
+    editorView = null;
+  }
+}
+
+function mountEditor() {
+  const host = document.querySelector<HTMLElement>("#editor");
+  if (!host) {
+    return;
+  }
+
+  const state = EditorState.create({
+    doc: noteText(activeFile),
+    extensions: [
+      history(),
+      markdown(),
+      syntaxHighlighting(defaultHighlightStyle, {fallback: true}),
+      livePreview(),
+      keymap.of([...defaultKeymap, ...historyKeymap]),
+      EditorView.lineWrapping,
+      EditorView.updateListener.of((update) => {
+        if (update.docChanged) {
+          const path = activeFile;
+          const content = update.state.doc.toString();
+          noteTexts.set(path, content);
+          if (suppressNextSave) {
+            suppressNextSave = false;
+            return;
+          }
+          dirtyFiles.add(path);
+          scheduleSave(path, content);
+        }
+      }),
+      EditorView.theme({
+        "&": {height: "100%"},
+        ".cm-scroller": {
+          fontFamily: "SFMono-Regular, Consolas, Liberation Mono, monospace",
+        },
+      }),
+    ],
+  });
+
+  editorView = new EditorView({state, parent: host});
+}
+
+function noteText(path: string) {
+  if (!path) {
+    return "";
+  }
+
+  if (!noteTexts.has(path)) {
+    noteTexts.set(path, loadedFiles.has(path) ? "" : placeholderNote(path));
+  }
+
+  return noteTexts.get(path) ?? "";
+}
+
+async function loadActiveFile() {
+  if (!activeFile) {
+    return;
+  }
+
+  await loadFile(activeFile);
+}
+
+async function loadFile(path: string) {
+  if (!currentVaultPath || !path || loadedFiles.has(path) || loadingFiles.has(path)) {
+    return;
+  }
+
+  loadingFiles.add(path);
+  setIndexSummary("Loading file...");
+  try {
+    const state = await invoke<FileContentState>("read_vault_file", {relativePath: path});
+    loadedFiles.add(state.path);
+    if (!dirtyFiles.has(state.path)) {
+      noteTexts.set(state.path, state.content);
+      if (state.path === activeFile && editorView) {
+        if (editorView.state.doc.toString() !== state.content) {
+          suppressNextSave = true;
+          editorView.dispatch({
+            changes: {from: 0, to: editorView.state.doc.length, insert: state.content},
+          });
+        }
+      }
+    } else {
+      scheduleSave(state.path, noteTexts.get(state.path) ?? "");
+    }
+    setIndexSummary("Loaded");
+  } catch (error) {
+    setIndexSummary(`Load failed: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    loadingFiles.delete(path);
+  }
+}
+
+function scheduleSave(path: string, content: string) {
+  if (!currentVaultPath || !path || !loadedFiles.has(path)) {
+    return;
+  }
+
+  const existingTimer = saveTimers.get(path);
+  if (existingTimer) {
+    window.clearTimeout(existingTimer);
+  }
+
+  setIndexSummary("Saving...");
+  const timer = window.setTimeout(async () => {
+    saveTimers.delete(path);
+    try {
+      await invoke("write_vault_file", {relativePath: path, content});
+      if (noteTexts.get(path) === content) {
+        dirtyFiles.delete(path);
+      }
+      setIndexSummary("Saved");
+    } catch (error) {
+      setIndexSummary(`Save failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, 700);
+
+  saveTimers.set(path, timer);
+}
+
+function setIndexSummary(summary: string) {
+  indexSummary = summary;
+  const summaryElement = document.querySelector<HTMLElement>("#index-summary");
+  if (summaryElement) {
+    summaryElement.textContent = summary;
+  }
+}
+
+function placeholderNote(path: string) {
+  const title = path.split("/").at(-1)?.replace(/\.md$/, "") ?? "Untitled";
+  return `# ${title}
+
+Noted keeps Markdown files as the first-class surface while still allowing quick code/file review when the modifier key is held over the vault tree.
+
+- Folder rows expand to show notes immediately.
+- Hold ${navigator.platform.includes("Mac") ? "Command" : "Control"} while hovering the tree to reveal non-Markdown files.
+- Agent context mode controls whether this note is attached to each request.
+
+> Live preview renders inactive Markdown lines. Click a rendered line to edit the raw Markdown.`;
 }
 
 async function handleTreeAction(action: HTMLElement) {
@@ -923,6 +1266,7 @@ async function deleteFileWithConfirmation(path: string) {
   for (const folder of folders) {
     folder.files = folder.files.filter((file) => file.path !== path);
   }
+  deleteCachedPath(path);
   openFiles = openFiles.filter((openPath) => openPath !== path);
   if (activeFile === path) {
     activeFile = openFiles[0] ?? folders.flatMap((folder) => folder.files)[0]?.path ?? "";
@@ -951,6 +1295,7 @@ async function deleteFolderWithConfirmation(path: string) {
   activeFolder = folders[0]?.path ?? "";
   activeFile = folders[0]?.files[0]?.path ?? "";
   openFiles = openFiles.filter((openPath) => !openPath.startsWith(`${path}/`));
+  deleteCachedPathPrefix(path);
   indexSummary = previewOnly ? "Folder delete preview" : "Folder deleted";
   expandedFolders.delete(path);
   render();
@@ -1007,6 +1352,7 @@ async function moveFile(kind: "folder" | "file", path: string, targetFolderPath:
   sourceFolder.files = sourceFolder.files.filter((candidate) => candidate.path !== path);
   const newPath = movedFile?.path ?? `${targetFolder.path === "." ? "" : `${targetFolder.path}/`}${file.name}`;
   targetFolder.files.push(movedFile ?? {...file, path: newPath});
+  replaceCachedPath(path, newPath);
   openFiles = openFiles.map((openPath) => (openPath === path ? newPath : openPath));
   if (activeFile === path) {
     activeFile = newPath;
@@ -1058,6 +1404,7 @@ function moveFolderInPreview(path: string, targetFolderPath: string) {
   openFiles = openFiles.map((openPath) =>
     openPath.startsWith(`${path}/`) ? `${newPath}${openPath.slice(path.length)}` : openPath,
   );
+  replaceCachedPathPrefix(path, newPath);
   expandedFolders.add(targetFolderPath);
   expandedFolders.add(newPath);
 }
@@ -1078,6 +1425,9 @@ async function createNewNote(folderPath: string, requestedName?: string) {
   }
 
   const path = note?.path ?? `${folder.path === "." ? "" : `${folder.path}/`}${name}`;
+  const content = "# Untitled\n";
+  noteTexts.set(path, content);
+  loadedFiles.add(path);
   folder.files.push(note ?? {name, path, kind: "markdown"});
   activeFolder = folder.path;
   expandedFolders.add(folder.path);
@@ -1129,7 +1479,15 @@ async function renameTreePath(target: TreeMenuTarget) {
 
   let previewOnly = false;
   try {
-    await invoke("rename_vault_path", {relativePath: target.path, newName});
+    const renamed = await invoke<{path: string; itemType: "folder" | "file"}>("rename_vault_path", {
+      relativePath: target.path,
+      newName,
+    });
+    if (target.kind === "file") {
+      replaceCachedPath(target.path, renamed.path);
+    } else {
+      replaceCachedPathPrefix(target.path, renamed.path);
+    }
     await refreshVaultTree();
   } catch {
     previewOnly = true;
@@ -1180,6 +1538,7 @@ function renameTreePathInPreview(target: TreeMenuTarget, newName: string) {
         file.path = newPath;
       }
     }
+    replaceCachedPath(target.path, newPath);
     openFiles = openFiles.map((path) => (path === target.path ? newPath : path));
     if (activeFile === target.path) {
       activeFile = newPath;
@@ -1205,6 +1564,7 @@ function renameTreePathInPreview(target: TreeMenuTarget, newName: string) {
     }
   }
   activeFolder = activeFolder === target.path ? newPath : activeFolder;
+  replaceCachedPathPrefix(target.path, newPath);
 }
 
 function uniqueNoteName(folder: FolderNode) {
@@ -1219,6 +1579,57 @@ function uniqueNoteName(folder: FolderNode) {
 
 function addOpenFile(path: string) {
   openFiles = [path, ...openFiles.filter((openPath) => openPath !== path)].slice(0, 6);
+}
+
+function replaceCachedPath(oldPath: string, newPath: string) {
+  const text = noteTexts.get(oldPath);
+  if (text !== undefined) {
+    noteTexts.delete(oldPath);
+    noteTexts.set(newPath, text);
+  }
+
+  transferSetPath(loadedFiles, oldPath, newPath);
+  transferSetPath(loadingFiles, oldPath, newPath);
+  transferSetPath(dirtyFiles, oldPath, newPath);
+  const timer = saveTimers.get(oldPath);
+  if (timer) {
+    window.clearTimeout(timer);
+    saveTimers.delete(oldPath);
+  }
+}
+
+function replaceCachedPathPrefix(oldPrefix: string, newPrefix: string) {
+  for (const path of Array.from(noteTexts.keys())) {
+    if (path === oldPrefix || path.startsWith(`${oldPrefix}/`)) {
+      replaceCachedPath(path, `${newPrefix}${path.slice(oldPrefix.length)}`);
+    }
+  }
+}
+
+function deleteCachedPath(path: string) {
+  noteTexts.delete(path);
+  loadedFiles.delete(path);
+  loadingFiles.delete(path);
+  dirtyFiles.delete(path);
+  const timer = saveTimers.get(path);
+  if (timer) {
+    window.clearTimeout(timer);
+    saveTimers.delete(path);
+  }
+}
+
+function deleteCachedPathPrefix(prefix: string) {
+  for (const path of Array.from(noteTexts.keys())) {
+    if (path === prefix || path.startsWith(`${prefix}/`)) {
+      deleteCachedPath(path);
+    }
+  }
+}
+
+function transferSetPath(paths: Set<string>, oldPath: string, newPath: string) {
+  if (paths.delete(oldPath)) {
+    paths.add(newPath);
+  }
 }
 
 function folderForFile(path: string) {
