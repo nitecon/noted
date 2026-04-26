@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "apps/noted-desktop/src-tauri",
     "crates/noted-core",
     "crates/noted-cli",
 ]
@@ -9,4 +10,3 @@ resolver = "3"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/whattingh/noted"
-

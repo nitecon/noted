@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Noted Live Preview Editor Prototype</title>
+  </head>
+  <body>
+    <main class="shell">
+      <aside class="sidebar" aria-label="Vault notes">
+        <div class="sidebar__header">Noted</div>
+        <button class="note-item note-item--active" type="button">
+          live-preview-prototype.md
+        </button>
+        <button class="note-item" type="button">meeting-notes.md</button>
+        <button class="note-item" type="button">project-outline.md</button>
+      </aside>
+      <section class="workspace" aria-label="Markdown editor">
+        <header class="toolbar">
+          <div>
+            <div class="toolbar__title">live-preview-prototype.md</div>
+            <div class="toolbar__meta">
+              Active line is raw Markdown. Inactive lines render in-place.
+            </div>
+          </div>
+          <div class="toolbar__status" id="render-status">ready</div>
+        </header>
+        <div id="editor" class="editor-host"></div>
+      </section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

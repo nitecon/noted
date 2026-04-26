@@ -1,5 +1,5 @@
 use noted_core::{
-    SearchMode, SearchOptions, VaultIndex, parse_markdown, search_vault, section_by_heading,
+    PersistentIndex, SearchMode, SearchOptions, parse_markdown, search_vault, section_by_heading,
 };
 use std::env;
 use std::fs;
@@ -87,24 +87,60 @@ fn parse_search_mode(value: &str) -> Result<SearchMode, Box<dyn std::error::Erro
 }
 
 fn index_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let vault = args
+    let mut rebuild = false;
+    let mut refresh = false;
+    let mut positionals = Vec::new();
+
+    for argument in args {
+        match argument.as_str() {
+            "--rebuild" => rebuild = true,
+            "--refresh" => refresh = true,
+            "--help" | "-h" => {
+                println!("usage: noted index [vault] [--refresh|--rebuild]");
+                return Ok(());
+            }
+            argument if argument.starts_with('-') => {
+                return Err(format!("unknown index option: {argument}").into());
+            }
+            argument => positionals.push(argument.to_owned()),
+        }
+    }
+
+    if rebuild && refresh {
+        return Err("usage: noted index [vault] [--refresh|--rebuild]".into());
+    }
+    if positionals.len() > 1 {
+        return Err("usage: noted index [vault] [--refresh|--rebuild]".into());
+    }
+
+    let vault = positionals
         .first()
         .map(PathBuf::from)
         .unwrap_or(env::current_dir()?);
-    let index = VaultIndex::build(&vault)?;
-    let stats = index.stats();
+    let update = if rebuild {
+        PersistentIndex::rebuild(&vault)?
+    } else {
+        PersistentIndex::refresh(&vault)?
+    };
+    let stats = update.index.stats();
 
     println!("vault: {}", vault.display());
+    println!("index: {}", update.manifest_path.display());
     println!("documents: {}", stats.documents);
     println!("terms: {}", stats.terms);
+    println!(
+        "scan: {} files, {} reused, {} updated, {} removed",
+        update.scanned, update.reused, update.updated, update.removed
+    );
 
-    for note in index.notes() {
-        let title = note.title.as_deref().unwrap_or("(untitled)");
+    for entry in update.index.entries() {
+        let title = entry.title.as_deref().unwrap_or("(untitled)");
         println!(
-            "{}\t{}\t{} bytes",
-            note.path.display(),
+            "{}\t{}\t{} bytes\t{} terms",
+            vault.join(&entry.path).display(),
             title,
-            note.byte_len
+            entry.byte_len,
+            entry.term_count
         );
     }
 
@@ -144,6 +180,6 @@ fn section_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn print_help() {
     println!(
-        "noted\n\nUSAGE:\n  noted index [vault]\n  noted search <query> [vault] [--limit n] [--mode bm25|vector]\n  noted outline <note.md>\n  noted section <note.md> <heading>"
+        "noted\n\nUSAGE:\n  noted index [vault] [--refresh|--rebuild]\n  noted search <query> [vault] [--limit n] [--mode bm25|vector]\n  noted outline <note.md>\n  noted section <note.md> <heading>"
     );
 }

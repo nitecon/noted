@@ -46,6 +46,7 @@ pub struct NoteDocument {
     pub title: Option<String>,
     pub byte_len: u64,
     pub modified_unix_seconds: Option<u64>,
+    pub term_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +93,7 @@ impl VaultIndex {
                 title: document.title.clone(),
                 byte_len: document.byte_len,
                 modified_unix_seconds: document.modified_unix_seconds,
+                term_count: document.terms.len(),
             })
             .collect()
     }
@@ -185,7 +187,7 @@ fn load_documents(root: &Path) -> io::Result<Vec<IndexedDocument>> {
         .collect()
 }
 
-fn collect_markdown_paths(path: &Path, paths: &mut Vec<PathBuf>) -> io::Result<()> {
+pub(crate) fn collect_markdown_paths(path: &Path, paths: &mut Vec<PathBuf>) -> io::Result<()> {
     if path.is_file() {
         if is_markdown(path) {
             paths.push(path.to_path_buf());
@@ -220,7 +222,7 @@ fn is_ignored_directory(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn first_heading(text: &str) -> Option<String> {
+pub(crate) fn first_heading(text: &str) -> Option<String> {
     text.lines().find_map(|line| {
         let line = line.trim_start();
         let level = line
@@ -235,7 +237,7 @@ fn first_heading(text: &str) -> Option<String> {
     })
 }
 
-fn modified_unix_seconds(metadata: &fs::Metadata) -> Option<u64> {
+pub(crate) fn modified_unix_seconds(metadata: &fs::Metadata) -> Option<u64> {
     metadata
         .modified()
         .ok()?
@@ -244,7 +246,7 @@ fn modified_unix_seconds(metadata: &fs::Metadata) -> Option<u64> {
         .map(|duration| duration.as_secs())
 }
 
-fn tokenize(text: &str) -> Vec<String> {
+pub(crate) fn tokenize(text: &str) -> Vec<String> {
     text.split(|character: char| !character.is_alphanumeric())
         .filter(|term| !term.is_empty())
         .map(|term| term.to_lowercase())
