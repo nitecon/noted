@@ -3,7 +3,7 @@ import {open} from "@tauri-apps/plugin-dialog";
 import {defaultKeymap, history, historyKeymap} from "@codemirror/commands";
 import {markdown} from "@codemirror/lang-markdown";
 import {defaultHighlightStyle, syntaxHighlighting} from "@codemirror/language";
-import {EditorState, RangeSetBuilder, StateEffect, type Extension} from "@codemirror/state";
+import {EditorState, RangeSetBuilder, StateEffect, StateField, type Extension} from "@codemirror/state";
 import {
   Decoration,
   EditorView,
@@ -86,6 +86,11 @@ type ChatMessage = {
 type ModelUpdate = {
   position: string;
   content: string;
+};
+
+type ParsedTable = {
+  headers: string[];
+  rows: string[][];
 };
 
 type DirectoryPickerHandle = {
@@ -195,9 +200,12 @@ let chatMessages: ChatMessage[] = [];
 let chatDraft = "";
 let nextChatMessageId = 1;
 let agentIsRunning = false;
+let editingTitle = false;
+let titleDraft = "";
 let pointerInTree = false;
 let treeScrollTop = 0;
 let expandedFolders = new Set(folders.map((folder) => folder.path));
+let rawTableFrom: number | null = null;
 let currentVaultPath: string | null = null;
 let configPath = "~/.noted/config.yml";
 let firstRun = false;
@@ -217,6 +225,8 @@ const loadedFiles = new Set<string>();
 const loadingFiles = new Set<string>();
 const dirtyFiles = new Set<string>();
 const saveTimers = new Map<string, number>();
+const noteUndoStacks = new Map<string, string[]>();
+const noteRedoStacks = new Map<string, string[]>();
 let suppressNextSave = false;
 const notedVersion = "0.0.0-source";
 
@@ -295,10 +305,17 @@ function render() {
 
         <header class="editor-toolbar">
           <div>
-            <p class="note-location">${activeFile}</p>
-            <h2>${activeFile.split("/").at(-1)?.replace(/\.md$/, "") ?? "Untitled"}</h2>
+            ${
+              editingTitle
+                ? `<input class="note-title-input" id="note-title-input" value="${escapeHtml(titleDraft)}" aria-label="Rename note" />`
+                : `<button type="button" class="note-title-button" id="note-title-button" aria-label="Rename note">
+                    ${escapeHtml(activeFileTitle())}
+                  </button>`
+            }
           </div>
           <div class="sync-state" aria-label="Document status">
+            <button type="button" id="undo-note" ${canUndoNote(activeFile) ? "" : "disabled"}>Undo</button>
+            <button type="button" id="redo-note" ${canRedoNote(activeFile) ? "" : "disabled"}>Redo</button>
             <button type="button" id="voice-document">Voice document</button>
             <button type="button" id="read-section">Read section</button>
           </div>
@@ -435,18 +452,45 @@ class MarkdownLineWidget extends WidgetType {
   }
 }
 
-class LivePreviewPlugin implements PluginValue {
-  decorations: DecorationSet;
+class MarkdownBlockWidget extends WidgetType {
+  constructor(
+    private readonly source: string,
+    private readonly kind: "code" | "table",
+    private readonly from: number,
+  ) {
+    super();
+  }
+
+  eq(other: MarkdownBlockWidget) {
+    return other.source === this.source && other.kind === this.kind && other.from === this.from;
+  }
+
+  toDOM() {
+    const wrapper = document.createElement("div");
+    wrapper.className = `cm-live-render-block cm-live-render-block--${this.kind}`;
+    wrapper.dataset.from = String(this.from);
+    if (this.kind === "table") {
+      wrapper.append(renderEditableTable(this.source, this.from));
+    } else {
+      wrapper.innerHTML = md.render(this.source);
+    }
+    return wrapper;
+  }
+
+  ignoreEvent() {
+    return this.kind === "table";
+  }
+}
+
+class LivePreviewIdlePlugin implements PluginValue {
   private idleTimer: number | undefined;
 
   constructor(private readonly view: EditorView) {
-    this.decorations = buildLivePreviewDecorations(view);
     this.scheduleIdleRefresh();
   }
 
   update(update: ViewUpdate) {
     if (update.docChanged || update.selectionSet || update.viewportChanged || update.focusChanged) {
-      this.decorations = buildLivePreviewDecorations(update.view);
       this.scheduleIdleRefresh();
     }
   }
@@ -463,7 +507,6 @@ class LivePreviewPlugin implements PluginValue {
     }
 
     this.idleTimer = window.setTimeout(() => {
-      this.decorations = buildLivePreviewDecorations(this.view);
       this.view.dispatch({effects: forceDecorationRefresh.of(null)});
       this.scheduleIdleRefresh();
     }, idleRenderDelayMs);
@@ -472,10 +515,25 @@ class LivePreviewPlugin implements PluginValue {
 
 const forceDecorationRefresh = StateEffect.define<null>();
 
+const livePreviewField = StateField.define<DecorationSet>({
+  create(state) {
+    return buildLivePreviewDecorations(state);
+  },
+  update(decorations, transaction) {
+    if (
+      transaction.docChanged ||
+      transaction.selection ||
+      transaction.effects.some((effect) => effect.is(forceDecorationRefresh))
+    ) {
+      return buildLivePreviewDecorations(transaction.state);
+    }
+    return decorations;
+  },
+  provide: (field) => EditorView.decorations.from(field),
+});
+
 function livePreview(): Extension {
-  return ViewPlugin.fromClass(LivePreviewPlugin, {
-    decorations: (plugin) => plugin.decorations,
-  });
+  return [livePreviewField, ViewPlugin.fromClass(LivePreviewIdlePlugin)];
 }
 
 function renderLine(source: string) {
@@ -527,6 +585,83 @@ function lineKindClass(source: string) {
   return "cm-live-render--paragraph";
 }
 
+function renderEditableTable(source: string, from: number) {
+  const parsed = parseMarkdownTable(source);
+  const table = document.createElement("table");
+  table.className = "editable-table";
+  table.dataset.from = String(from);
+
+  const thead = document.createElement("thead");
+  const headerRow = document.createElement("tr");
+  parsed.headers.forEach((value, columnIndex) => {
+    const th = document.createElement("th");
+    th.append(tableCellInput(from, "header", 0, columnIndex, value));
+    headerRow.append(th);
+  });
+  const actionHeader = document.createElement("th");
+  actionHeader.className = "editable-table__actions";
+  const addColumnButton = document.createElement("button");
+  addColumnButton.type = "button";
+  addColumnButton.textContent = "+";
+  addColumnButton.title = "Add column";
+  addColumnButton.dataset.tableAction = "add-column";
+  addColumnButton.dataset.tableFrom = String(from);
+  actionHeader.append(addColumnButton);
+  headerRow.append(actionHeader);
+  thead.append(headerRow);
+  table.append(thead);
+
+  const tbody = document.createElement("tbody");
+  const rows = [...parsed.rows, parsed.headers.map(() => "")];
+  rows.forEach((row, rowIndex) => {
+    const tr = document.createElement("tr");
+    for (let columnIndex = 0; columnIndex < parsed.headers.length; columnIndex += 1) {
+      const td = document.createElement("td");
+      td.append(tableCellInput(from, "body", rowIndex, columnIndex, row[columnIndex] ?? ""));
+      tr.append(td);
+    }
+    const actionCell = document.createElement("td");
+    actionCell.className = "editable-table__actions";
+    tr.append(actionCell);
+    tbody.append(tr);
+  });
+  table.append(tbody);
+
+  return table;
+}
+
+function tableCellInput(
+  from: number,
+  section: "header" | "body",
+  rowIndex: number,
+  columnIndex: number,
+  value: string,
+) {
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = value;
+  input.dataset.tableFrom = String(from);
+  input.dataset.tableSection = section;
+  input.dataset.tableRow = String(rowIndex);
+  input.dataset.tableColumn = String(columnIndex);
+  input.dataset.committedValue = value;
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Tab") {
+      event.preventDefault();
+      applyEditableTableChange(input);
+      focusEditableTableCell(input, event.shiftKey ? "previous" : "next");
+      return;
+    }
+
+    if (event.key === "Enter") {
+      event.preventDefault();
+      applyEditableTableChange(input);
+      insertEditableTableRow(input, event.shiftKey ? "above" : "below");
+    }
+  });
+  return input;
+}
+
 function escapeHtml(value: string) {
   return value
     .replaceAll("&", "&amp;")
@@ -535,38 +670,404 @@ function escapeHtml(value: string) {
     .replaceAll('"', "&quot;");
 }
 
-function buildLivePreviewDecorations(view: EditorView) {
+function buildLivePreviewDecorations(state: EditorState) {
   const activeLines = new Set<number>();
-  for (const range of view.state.selection.ranges) {
-    const startLine = view.state.doc.lineAt(range.from).number;
-    const endLine = view.state.doc.lineAt(range.to).number;
+  for (const range of state.selection.ranges) {
+    const startLine = state.doc.lineAt(range.from).number;
+    const endLine = state.doc.lineAt(range.to).number;
     for (let lineNumber = startLine; lineNumber <= endLine; lineNumber += 1) {
       activeLines.add(lineNumber);
     }
   }
 
   const builder = new RangeSetBuilder<Decoration>();
-  for (const {from, to} of view.visibleRanges) {
-    let pos = from;
-    while (pos <= to) {
-      const line = view.state.doc.lineAt(pos);
-      if (!activeLines.has(line.number) && line.text.trim().length > 0) {
-        builder.add(
-          line.from,
-          line.to,
-          Decoration.replace({
-            widget: new MarkdownLineWidget(line.text, line.number),
-            inclusive: false,
-          }),
-        );
-      }
+  for (let lineNumber = 1; lineNumber <= state.doc.lines; lineNumber += 1) {
+    const line = state.doc.line(lineNumber);
+    const block = inactiveBlockAt(state, line.number, activeLines);
+    if (block) {
+      builder.add(
+        block.from,
+        block.to,
+        Decoration.replace({
+          widget: new MarkdownBlockWidget(block.source, block.kind, block.from),
+          block: true,
+          inclusive: false,
+        }),
+      );
+      lineNumber = block.endLine;
+      continue;
+    }
 
-      if (line.to >= to || line.to === view.state.doc.length) break;
-      pos = line.to + 1;
+    if (!activeLines.has(line.number) && line.text.trim().length > 0) {
+      builder.add(
+        line.from,
+        line.to,
+        Decoration.replace({
+          widget: new MarkdownLineWidget(line.text, line.number),
+          inclusive: false,
+        }),
+      );
     }
   }
 
   return builder.finish();
+}
+
+function inactiveBlockAt(state: EditorState, lineNumber: number, activeLines: Set<number>) {
+  return fencedCodeBlockAt(state, lineNumber, activeLines) ?? tableBlockAt(state, lineNumber, activeLines);
+}
+
+function fencedCodeBlockAt(state: EditorState, lineNumber: number, activeLines: Set<number>) {
+  const start = state.doc.line(lineNumber);
+  const fence = start.text.match(/^\s*(```+|~~~+)/);
+  if (!fence) {
+    return null;
+  }
+
+  const marker = fence[1][0];
+  let endLineNumber = lineNumber;
+  for (let candidate = lineNumber + 1; candidate <= state.doc.lines; candidate += 1) {
+    const line = state.doc.line(candidate);
+    if (new RegExp(`^\\s*${marker}{3,}\\s*$`).test(line.text)) {
+      endLineNumber = candidate;
+      break;
+    }
+    endLineNumber = candidate;
+  }
+
+  if (blockTouchesActiveLine(lineNumber, endLineNumber, activeLines)) {
+    return null;
+  }
+
+  const end = state.doc.line(endLineNumber);
+  return {
+    kind: "code" as const,
+    from: start.from,
+    to: end.to,
+    endLine: endLineNumber,
+    source: state.doc.sliceString(start.from, end.to),
+  };
+}
+
+function tableBlockAt(state: EditorState, lineNumber: number, activeLines: Set<number>) {
+  if (lineNumber >= state.doc.lines) {
+    return null;
+  }
+
+  const header = state.doc.line(lineNumber);
+  const separator = state.doc.line(lineNumber + 1);
+  if (!looksLikeTableRow(header.text) || !looksLikeTableSeparator(separator.text)) {
+    return null;
+  }
+
+  let endLineNumber = lineNumber + 1;
+  for (let candidate = lineNumber + 2; candidate <= state.doc.lines; candidate += 1) {
+    const line = state.doc.line(candidate);
+    if (!looksLikeTableRow(line.text)) {
+      break;
+    }
+    endLineNumber = candidate;
+  }
+
+  const end = state.doc.line(endLineNumber);
+  if (rawTableFrom !== null && rawTableFrom >= header.from && rawTableFrom <= end.to) {
+    if (blockTouchesActiveLine(lineNumber, endLineNumber, activeLines)) {
+      return null;
+    }
+    rawTableFrom = null;
+  }
+
+  return {
+    kind: "table" as const,
+    from: header.from,
+    to: end.to,
+    endLine: endLineNumber,
+    source: state.doc.sliceString(header.from, end.to),
+  };
+}
+
+function looksLikeTableRow(text: string) {
+  return text.includes("|") && text.trim().length > 0;
+}
+
+function looksLikeTableSeparator(text: string) {
+  return /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(text);
+}
+
+function parseMarkdownTable(source: string): ParsedTable {
+  const lines = source.split("\n").filter((line) => line.trim().length > 0);
+  const headers = splitTableRow(lines[0] ?? "");
+  const rows = lines.slice(2).map(splitTableRow);
+  return {
+    headers,
+    rows: rows.map((row) => normalizeTableRow(row, headers.length)),
+  };
+}
+
+function splitTableRow(row: string) {
+  const trimmed = row.trim().replace(/^\|/, "").replace(/\|$/, "");
+  return trimmed.split("|").map((cell) => cell.trim());
+}
+
+function normalizeTableRow(row: string[], width: number) {
+  return Array.from({length: width}, (_, index) => row[index] ?? "");
+}
+
+function serializeMarkdownTable(table: ParsedTable) {
+  const headers = table.headers.map(cleanTableCell);
+  const rows = table.rows
+    .map((row) => normalizeTableRow(row, headers.length).map(cleanTableCell))
+    .filter((row) => row.some((cell) => cell.trim().length > 0));
+
+  return [
+    markdownTableRow(headers),
+    markdownTableRow(headers.map((header) => "-".repeat(Math.max(3, header.length)))),
+    ...rows.map(markdownTableRow),
+  ].join("\n");
+}
+
+function markdownTableRow(cells: string[]) {
+  return `| ${cells.join(" | ")} |`;
+}
+
+function cleanTableCell(value: string) {
+  return value.replace(/\r?\n/g, " ").replace(/\|/g, "\\|").trim();
+}
+
+function applyEditableTableChange(input: HTMLInputElement) {
+  if (!editorView || !activeFile) {
+    return;
+  }
+
+  if (input.dataset.committedValue === input.value) {
+    return;
+  }
+
+  const from = Number(input.dataset.tableFrom);
+  const columnIndex = Number(input.dataset.tableColumn);
+  const rowIndex = Number(input.dataset.tableRow);
+  const section = input.dataset.tableSection;
+  if (!Number.isFinite(from) || !Number.isFinite(columnIndex) || !Number.isFinite(rowIndex)) {
+    return;
+  }
+
+  const state = editorView.state;
+  const line = state.doc.lineAt(Math.min(from, state.doc.length));
+  const block = tableBlockAt(state, line.number, new Set());
+  if (!block) {
+    return;
+  }
+
+  const parsed = parseMarkdownTable(block.source);
+  if (section === "header") {
+    parsed.headers[columnIndex] = input.value;
+  } else {
+    parsed.rows[rowIndex] = normalizeTableRow(parsed.rows[rowIndex] ?? [], parsed.headers.length);
+    parsed.rows[rowIndex][columnIndex] = input.value;
+  }
+
+  const current = state.doc.toString();
+  const nextSource = serializeMarkdownTable(parsed);
+  if (nextSource === block.source) {
+    input.dataset.committedValue = input.value;
+    return;
+  }
+
+  input.dataset.committedValue = input.value;
+  recordNoteUndo(activeFile, current);
+  editorView.dispatch({
+    changes: {
+      from: block.from,
+      to: block.to,
+      insert: nextSource,
+    },
+  });
+}
+
+function focusEditableTableCell(input: HTMLInputElement, direction: "next" | "previous") {
+  const current = tableCellAddress(input);
+  if (!current) {
+    return;
+  }
+
+  const rowCount = input.closest("tbody")?.querySelectorAll("tr").length ?? current.rowIndex + 1;
+  const lastRow = rowCount - 1;
+  const lastColumn = current.columnCount - 1;
+  let nextSection: "header" | "body" = current.section;
+  let nextRow = current.rowIndex;
+  let nextColumn = current.columnIndex;
+
+  if (direction === "next") {
+    if (nextColumn < lastColumn) {
+      nextColumn += 1;
+    } else if (nextSection === "header") {
+      nextSection = "body";
+      nextRow = 0;
+      nextColumn = 0;
+    } else if (nextRow < lastRow) {
+      nextRow += 1;
+      nextColumn = 0;
+    } else {
+      nextRow += 1;
+      nextColumn = 0;
+    }
+  } else if (nextColumn > 0) {
+    nextColumn -= 1;
+  } else if (nextSection === "body" && nextRow > 0) {
+    nextRow -= 1;
+    nextColumn = lastColumn;
+  } else if (nextSection === "body") {
+    nextSection = "header";
+    nextColumn = lastColumn;
+  } else {
+    nextSection = "body";
+    nextRow = lastRow;
+    nextColumn = lastColumn;
+  }
+
+  focusEditableTableCellByAddress(current.from, nextSection, nextRow, nextColumn);
+}
+
+function insertEditableTableRow(input: HTMLInputElement, position: "above" | "below") {
+  if (!editorView || !activeFile) {
+    return;
+  }
+
+  const current = tableCellAddress(input);
+  if (!current) {
+    return;
+  }
+
+  const block = editableTableBlock(current.from);
+  if (!block) {
+    return;
+  }
+
+  const parsed = parseMarkdownTable(block.source);
+  const rows = parsed.rows.length ? [...parsed.rows] : [parsed.headers.map(() => "")];
+  const baseIndex = current.section === "header" ? 0 : current.rowIndex + (position === "below" ? 1 : 0);
+  rows.splice(baseIndex, 0, parsed.headers.map(() => ""));
+  parsed.rows = rows;
+
+  commitEditableTable(block, parsed);
+  focusEditableTableCellByAddress(current.from, "body", baseIndex, current.columnIndex);
+}
+
+function addEditableTableColumn(from: number) {
+  if (!editorView || !activeFile) {
+    return;
+  }
+
+  const block = editableTableBlock(from);
+  if (!block) {
+    return;
+  }
+
+  const parsed = parseMarkdownTable(block.source);
+  parsed.headers.push("Column");
+  parsed.rows = parsed.rows.map((row) => [...normalizeTableRow(row, parsed.headers.length - 1), ""]);
+  commitEditableTable(block, parsed);
+  focusEditableTableCellByAddress(from, "header", 0, parsed.headers.length - 1);
+}
+
+function editableTableBlock(from: number) {
+  if (!editorView || !Number.isFinite(from)) {
+    return null;
+  }
+
+  const state = editorView.state;
+  const line = state.doc.lineAt(Math.min(from, state.doc.length));
+  return tableBlockAt(state, line.number, new Set());
+}
+
+function commitEditableTable(
+  block: NonNullable<ReturnType<typeof tableBlockAt>>,
+  parsed: ParsedTable,
+) {
+  if (!editorView || !activeFile) {
+    return;
+  }
+
+  const current = editorView.state.doc.toString();
+  const nextSource = serializeMarkdownTable(parsed);
+  if (nextSource === block.source) {
+    return;
+  }
+
+  recordNoteUndo(activeFile, current);
+  editorView.dispatch({
+    changes: {
+      from: block.from,
+      to: block.to,
+      insert: nextSource,
+    },
+  });
+}
+
+function focusEditableTableCellByAddress(
+  from: number,
+  section: "header" | "body",
+  rowIndex: number,
+  columnIndex: number,
+) {
+  window.requestAnimationFrame(() => {
+    const selector = [
+      `[data-table-from="${from}"]`,
+      `[data-table-section="${section}"]`,
+      `[data-table-row="${rowIndex}"]`,
+      `[data-table-column="${columnIndex}"]`,
+    ].join("");
+    const nextInput = document.querySelector<HTMLInputElement>(selector);
+    nextInput?.focus();
+    nextInput?.select();
+  });
+}
+
+function tableCellAddress(input: HTMLInputElement) {
+  const from = Number(input.dataset.tableFrom);
+  const rowIndex = Number(input.dataset.tableRow);
+  const columnIndex = Number(input.dataset.tableColumn);
+  const section = input.dataset.tableSection;
+  const columnCount = input.closest("tr")?.querySelectorAll<HTMLInputElement>("[data-table-column]").length ?? 0;
+  if (
+    !Number.isFinite(from) ||
+    !Number.isFinite(rowIndex) ||
+    !Number.isFinite(columnIndex) ||
+    (section !== "header" && section !== "body") ||
+    columnCount < 1
+  ) {
+    return null;
+  }
+
+  return {
+    from,
+    section: section as "header" | "body",
+    rowIndex,
+    columnIndex,
+    columnCount,
+  };
+}
+
+function tableTouchesEditFocus(state: EditorState, start: number, end: number, activeLines: Set<number>) {
+  if (blockTouchesActiveLine(start, end, activeLines)) {
+    return true;
+  }
+
+  const nextLineNumber = end + 1;
+  if (nextLineNumber <= state.doc.lines && activeLines.has(nextLineNumber)) {
+    return state.doc.line(nextLineNumber).text.trim() === "";
+  }
+
+  return false;
+}
+
+function blockTouchesActiveLine(start: number, end: number, activeLines: Set<number>) {
+  for (let lineNumber = start; lineNumber <= end; lineNumber += 1) {
+    if (activeLines.has(lineNumber)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function treeMenuItems(target: TreeMenuTarget) {
@@ -623,7 +1124,12 @@ function renderChatThread(agent: AgentOption) {
       agentIsRunning
         ? `<article class="message assistant pending">
             <span class="message-label">${escapeHtml(agent.label)}</span>
-            <p>Running ${escapeHtml(selectedModel)}...</p>
+            <div class="thinking-bubbles" aria-label="Agent thinking">
+              <span></span>
+              <span></span>
+              <span></span>
+            </div>
+            <p>Running ${escapeHtml(selectedModel)}</p>
           </article>`
         : ""
     }
@@ -955,6 +1461,41 @@ function bindEvents() {
     render();
   });
 
+  document.querySelector<HTMLButtonElement>("#undo-note")?.addEventListener("click", () => {
+    undoNote(activeFile);
+  });
+
+  document.querySelector<HTMLButtonElement>("#redo-note")?.addEventListener("click", () => {
+    redoNote(activeFile);
+  });
+
+  document.querySelector<HTMLButtonElement>("#note-title-button")?.addEventListener("click", () => {
+    editingTitle = true;
+    titleDraft = activeFileTitle();
+    render();
+  });
+
+  const titleInput = document.querySelector<HTMLInputElement>("#note-title-input");
+  titleInput?.focus();
+  titleInput?.select();
+  titleInput?.addEventListener("input", (event) => {
+    titleDraft = sanitizeNoteTitle((event.currentTarget as HTMLInputElement).value);
+    (event.currentTarget as HTMLInputElement).value = titleDraft;
+  });
+  titleInput?.addEventListener("blur", () => {
+    void commitActiveTitleRename();
+  });
+  titleInput?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void commitActiveTitleRename();
+    } else if (event.key === "Escape") {
+      editingTitle = false;
+      titleDraft = "";
+      render();
+    }
+  });
+
   document.querySelector<HTMLButtonElement>("#voice-document")?.addEventListener("click", () => {
     indexSummary = "Voice document queued";
     render();
@@ -1023,6 +1564,58 @@ function bindEvents() {
       text: selection,
     };
     render();
+  });
+
+  document.querySelector(".editor-shell")?.addEventListener("click", (event) => {
+    const mouseEvent = event as MouseEvent;
+    const link = (event.target as HTMLElement).closest<HTMLAnchorElement>(".cm-live-render a, .cm-live-render-block a");
+    if (link && (mouseEvent.metaKey || mouseEvent.ctrlKey)) {
+      event.preventDefault();
+      event.stopPropagation();
+      openExternalLink(link.href);
+      return;
+    }
+
+    const table = (event.target as HTMLElement).closest<HTMLElement>(".cm-live-render-block--table");
+    if (table?.dataset.from && (mouseEvent.metaKey || mouseEvent.ctrlKey) && editorView) {
+      event.preventDefault();
+      event.stopPropagation();
+      const position = Number(table.dataset.from);
+      rawTableFrom = position;
+      editorView.focus();
+      editorView.dispatch({selection: {anchor: position}});
+      return;
+    }
+
+  });
+
+  document.querySelector(".editor-shell")?.addEventListener("click", (event) => {
+    const action = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-table-action]");
+    if (!action || action.dataset.tableAction !== "add-column") {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    addEditableTableColumn(Number(action.dataset.tableFrom));
+  });
+
+  document.querySelector(".editor-shell")?.addEventListener("change", (event) => {
+    const input = (event.target as HTMLElement).closest<HTMLInputElement>("[data-table-from]");
+    if (!input) {
+      return;
+    }
+
+    applyEditableTableChange(input);
+  });
+
+  document.querySelector(".editor-shell")?.addEventListener("focusout", (event) => {
+    const input = (event.target as HTMLElement).closest<HTMLInputElement>("[data-table-from]");
+    if (!input) {
+      return;
+    }
+
+    applyEditableTableChange(input);
   });
 
   document.addEventListener("click", (event) => {
@@ -1237,6 +1830,15 @@ function visiblePathSummary() {
     .join("\n");
 }
 
+function openExternalLink(href: string) {
+  const url = new URL(href, window.location.href);
+  if (!["http:", "https:", "mailto:"].includes(url.protocol)) {
+    return;
+  }
+
+  window.open(url.href, "_blank", "noopener,noreferrer");
+}
+
 function numberedNoteText(path: string) {
   return noteText(path)
     .split("\n")
@@ -1262,16 +1864,8 @@ function parseModelUpdate(output: string): ModelUpdate | null {
 function applyModelUpdate(path: string, update: ModelUpdate) {
   const current = noteText(path);
   const next = applyModelUpdateToText(current, update);
-  noteTexts.set(path, next);
-  dirtyFiles.add(path);
-
-  if (path === activeFile && editorView) {
-    editorView.dispatch({
-      changes: {from: 0, to: editorView.state.doc.length, insert: next},
-    });
-  } else {
-    scheduleSave(path, next);
-  }
+  recordNoteUndo(path, current);
+  applyNoteContent(path, next);
 
   return {
     message: `Applied model update to ${path} (${update.position}).`,
@@ -1311,6 +1905,105 @@ function applyModelUpdateToText(current: string, update: ModelUpdate) {
   }
 
   throw new Error(`Unsupported update position: ${update.position}`);
+}
+
+function applyNoteContent(path: string, content: string) {
+  noteTexts.set(path, content);
+  dirtyFiles.add(path);
+
+  if (path === activeFile && editorView) {
+    editorView.dispatch({
+      changes: {from: 0, to: editorView.state.doc.length, insert: content},
+    });
+    return;
+  }
+
+  scheduleSave(path, content);
+}
+
+function recordNoteUndo(path: string, snapshot: string) {
+  const current = noteText(path);
+  if (snapshot === current && (noteUndoStacks.get(path)?.at(-1) ?? "") === snapshot) {
+    return;
+  }
+
+  const stack = noteUndoStacks.get(path) ?? [];
+  if (stack.at(-1) !== snapshot) {
+    stack.push(snapshot);
+  }
+  noteUndoStacks.set(path, stack.slice(-50));
+  noteRedoStacks.set(path, []);
+}
+
+function undoNote(path: string) {
+  const stack = noteUndoStacks.get(path);
+  const previous = stack?.pop();
+  if (previous === undefined) {
+    return;
+  }
+
+  const current = noteText(path);
+  const redoStack = noteRedoStacks.get(path) ?? [];
+  redoStack.push(current);
+  noteRedoStacks.set(path, redoStack.slice(-50));
+  noteUndoStacks.set(path, stack ?? []);
+  applyNoteContent(path, previous);
+  setIndexSummary("Undo applied");
+  render();
+}
+
+function redoNote(path: string) {
+  const stack = noteRedoStacks.get(path);
+  const next = stack?.pop();
+  if (next === undefined) {
+    return;
+  }
+
+  const current = noteText(path);
+  const undoStack = noteUndoStacks.get(path) ?? [];
+  undoStack.push(current);
+  noteUndoStacks.set(path, undoStack.slice(-50));
+  noteRedoStacks.set(path, stack ?? []);
+  applyNoteContent(path, next);
+  setIndexSummary("Redo applied");
+  render();
+}
+
+function canUndoNote(path: string) {
+  return (noteUndoStacks.get(path)?.length ?? 0) > 0;
+}
+
+function canRedoNote(path: string) {
+  return (noteRedoStacks.get(path)?.length ?? 0) > 0;
+}
+
+async function commitActiveTitleRename() {
+  if (!editingTitle) {
+    return;
+  }
+
+  const oldPath = activeFile;
+  const cleanTitle = sanitizeNoteTitle(titleDraft);
+  const currentTitle = activeFileTitle(oldPath);
+  editingTitle = false;
+  titleDraft = "";
+  if (!cleanTitle || cleanTitle === currentTitle) {
+    render();
+    return;
+  }
+
+  const newName = `${cleanTitle}${activeFileExtension(oldPath)}`;
+  try {
+    await invoke("rename_vault_path", {relativePath: oldPath, newName});
+  } catch (error) {
+    indexSummary = `Rename failed: ${error instanceof Error ? error.message : String(error)}`;
+    render();
+    return;
+  }
+
+  renameTreePathInPreview({x: 0, y: 0, kind: "file", path: oldPath}, newName);
+  indexSummary = "Renamed";
+  render();
 }
 
 function persistEditorText() {
@@ -1897,6 +2590,8 @@ function replaceCachedPath(oldPath: string, newPath: string) {
   transferSetPath(loadedFiles, oldPath, newPath);
   transferSetPath(loadingFiles, oldPath, newPath);
   transferSetPath(dirtyFiles, oldPath, newPath);
+  transferMapPath(noteUndoStacks, oldPath, newPath);
+  transferMapPath(noteRedoStacks, oldPath, newPath);
   const timer = saveTimers.get(oldPath);
   if (timer) {
     window.clearTimeout(timer);
@@ -1917,6 +2612,8 @@ function deleteCachedPath(path: string) {
   loadedFiles.delete(path);
   loadingFiles.delete(path);
   dirtyFiles.delete(path);
+  noteUndoStacks.delete(path);
+  noteRedoStacks.delete(path);
   const timer = saveTimers.get(path);
   if (timer) {
     window.clearTimeout(timer);
@@ -1938,8 +2635,27 @@ function transferSetPath(paths: Set<string>, oldPath: string, newPath: string) {
   }
 }
 
+function transferMapPath<T>(paths: Map<string, T>, oldPath: string, newPath: string) {
+  const value = paths.get(oldPath);
+  if (value !== undefined) {
+    paths.delete(oldPath);
+    paths.set(newPath, value);
+  }
+}
+
 function folderForFile(path: string) {
   return folders.find((folder) => folder.files.some((file) => file.path === path))?.path;
+}
+
+function activeFileTitle(path = activeFile) {
+  const name = path.split("/").at(-1) ?? "Untitled";
+  return name.replace(/\.[^.]+$/, "");
+}
+
+function activeFileExtension(path = activeFile) {
+  const name = path.split("/").at(-1) ?? "";
+  const match = name.match(/(\.[^.]+)$/);
+  return match?.[1] ?? ".md";
 }
 
 function vaultRootName() {
@@ -1996,6 +2712,14 @@ function normalizeMarkdownName(name: string | null) {
   }
 
   return /\.(md|markdown)$/i.test(cleaned) ? cleaned : `${cleaned}.md`;
+}
+
+function sanitizeNoteTitle(value: string) {
+  return value
+    .replace(/[^A-Za-z0-9 _-]/g, "-")
+    .replace(/[ ]{2,}/g, " ")
+    .replace(/-{2,}/g, "-")
+    .replace(/^[-_ ]+|[-_ ]+$/g, "");
 }
 
 function updateAllFilesReveal(nextValue: boolean) {
@@ -2121,6 +2845,26 @@ loadVaultConfig();
 detectAgents();
 
 window.addEventListener("keydown", (event) => {
+  const target = event.target as HTMLElement | null;
+  if ((event.metaKey || event.ctrlKey) && !target?.closest(".cm-editor, #agent-prompt")) {
+    const key = event.key.toLowerCase();
+    if (key === "z" && event.shiftKey && canRedoNote(activeFile)) {
+      event.preventDefault();
+      redoNote(activeFile);
+      return;
+    }
+    if (key === "z" && canUndoNote(activeFile)) {
+      event.preventDefault();
+      undoNote(activeFile);
+      return;
+    }
+    if (key === "y" && canRedoNote(activeFile)) {
+      event.preventDefault();
+      redoNote(activeFile);
+      return;
+    }
+  }
+
   if (pointerInTree && (event.metaKey || event.ctrlKey)) {
     updateAllFilesReveal(true);
   }
