@@ -165,14 +165,13 @@ fn build_index(
         let byte_len = metadata.len();
         let modified = modified_unix_seconds(&metadata);
 
-        if let Some(existing_entry) = existing_entries.get(&relative_path) {
-            if existing_entry.byte_len == byte_len
-                && existing_entry.modified_unix_seconds == modified
-            {
-                entries.push(existing_entry.clone());
-                reused += 1;
-                continue;
-            }
+        if let Some(existing_entry) = existing_entries.get(&relative_path)
+            && existing_entry.byte_len == byte_len
+            && existing_entry.modified_unix_seconds == modified
+        {
+            entries.push(existing_entry.clone());
+            reused += 1;
+            continue;
         }
 
         let text = fs::read_to_string(&path)?;
