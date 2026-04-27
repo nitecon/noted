@@ -64,10 +64,13 @@ jobs:
         platform:
           - name: macOS
             os: macos-latest
+            args: --bundles app
           - name: Windows
             os: windows-latest
+            args: --bundles nsis
           - name: Linux
             os: ubuntu-22.04
+            args: --bundles deb,appimage
     runs-on: ${{ matrix.platform.os }}
 
     steps:
@@ -92,12 +95,32 @@ jobs:
         working-directory: apps/noted-desktop
         run: npm install --no-audit --no-fund
 
+      - name: Stamp release version
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          node - <<'NODE'
+          const fs = require("fs");
+          const version = process.env.VERSION.replace(/^v/, "");
+          const updates = [
+            "apps/noted-desktop/package.json",
+            "apps/noted-desktop/src-tauri/tauri.conf.json",
+          ];
+          for (const path of updates) {
+            const data = JSON.parse(fs.readFileSync(path, "utf8"));
+            data.version = version;
+            fs.writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`);
+          }
+          NODE
+
       - name: Build and upload release asset
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: apps/noted-desktop
+          args: ${{ matrix.platform.args }}
           tagName: ${{ github.ref_name }}
           releaseName: Noted ${{ github.ref_name }}
           releaseBody: Desktop builds for Noted ${{ github.ref_name }}.

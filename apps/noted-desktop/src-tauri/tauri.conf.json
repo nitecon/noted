@@ -3,6 +3,13 @@
   "productName": "Noted",
   "version": "0.0.0-source",
   "identifier": "org.whattingh.noted",
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Productivity",
+    "shortDescription": "Local-first Markdown notes",
+    "longDescription": "Noted is a local-first Markdown notes app for AI-assisted writing, search, and organization."
+  },
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
