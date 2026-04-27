@@ -745,16 +745,31 @@ h2 {
   background: #f7fbf8;
 }
 
+.message.pending {
+  border-style: dashed;
+}
+
 .message-label {
   color: #6d675c;
   font-size: 0.75rem;
   font-weight: 700;
 }
 
+.message-meta {
+  display: block;
+  overflow: hidden;
+  margin-top: 2px;
+  color: #80786b;
+  font-size: 0.68rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .message p {
   margin: 4px 0 0;
   color: #2f332f;
   line-height: 1.45;
+  white-space: pre-wrap;
 }
 
 .prompt-box {

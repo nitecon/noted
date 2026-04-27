@@ -31,6 +31,7 @@ type FolderNode = {
 
 type AgentId = "codex" | "gemini" | "claude";
 type ChatMode = "note" | "path";
+type ChatRole = "assistant" | "user";
 
 type AgentOption = {
   id: AgentId;
@@ -62,6 +63,28 @@ type VaultOpenState = {
 
 type FileContentState = {
   path: string;
+  content: string;
+};
+
+type AgentRunResponse = {
+  agent: string;
+  model: string;
+  command: string;
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+};
+
+type ChatMessage = {
+  id: number;
+  role: ChatRole;
+  label: string;
+  content: string;
+  meta?: string;
+};
+
+type ModelUpdate = {
+  position: string;
   content: string;
 };
 
@@ -139,24 +162,24 @@ const agentOptions: AgentOption[] = [
     id: "codex",
     label: "Codex",
     command: "codex",
-    models: ["gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"],
-    defaultModel: "gpt-5.3-codex",
+    models: ["default", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"],
+    defaultModel: "default",
     available: false,
   },
   {
     id: "gemini",
     label: "Gemini",
     command: "gemini",
-    models: ["gemini-2.5-pro", "gemini-2.5-flash"],
-    defaultModel: "gemini-2.5-pro",
+    models: ["default", "gemini-2.5-pro", "gemini-2.5-flash"],
+    defaultModel: "default",
     available: false,
   },
   {
     id: "claude",
     label: "Claude",
     command: "claude",
-    models: ["opus", "sonnet", "haiku"],
-    defaultModel: "sonnet",
+    models: ["default", "opus", "sonnet", "haiku"],
+    defaultModel: "default",
     available: false,
   },
 ];
@@ -166,13 +189,19 @@ let activeFolder = "Inbox";
 let activeFile = "Inbox/Project overview.md";
 let openFiles = ["Inbox/Project overview.md", "Noted/Desktop shell.md"];
 let selectedAgent: AgentId = "codex";
-let selectedModel = "gpt-5.3-codex";
+let selectedModel = "default";
 let chatMode: ChatMode = "note";
+let chatMessages: ChatMessage[] = [];
+let chatDraft = "";
+let nextChatMessageId = 1;
+let agentIsRunning = false;
 let pointerInTree = false;
+let treeScrollTop = 0;
 let expandedFolders = new Set(folders.map((folder) => folder.path));
 let currentVaultPath: string | null = null;
 let configPath = "~/.noted/config.yml";
 let firstRun = false;
+let isOpeningVault = false;
 let indexSummary = "Index pending";
 let firstRunError: string | null = null;
 let listenMode = false;
@@ -208,6 +237,7 @@ function activeAgent() {
 }
 
 function render() {
+  captureTransientUiState();
   persistEditorText();
   const agent = activeAgent();
 
@@ -299,21 +329,8 @@ function render() {
             Path
           </button>
         </div>
-        <section class="chat-thread" aria-label="Chat placeholder">
-          <article class="message assistant">
-            <span class="message-label">${agent.label}</span>
-            <p>${agent.available ? "Command detected in PATH." : "Command not detected yet."} ${
-              listenMode
-                ? `Voice-to-text will send to ${agent.label} using ${selectedModel} after a 5 second pause.`
-                : chatMode === "note"
-                  ? "The active note will be attached to each request."
-                : "Use @file mentions and tool words like search, list, outline, or section."
-            }</p>
-          </article>
-          <article class="message user">
-            <span class="message-label">You</span>
-            <p>${chatMode === "note" ? "Help revise the current note." : "Search @Research for vector notes."}</p>
-          </article>
+        <section class="chat-thread" aria-label="Chat">
+          ${renderChatThread(agent)}
         </section>
 
         ${renderChatInput(agent)}
@@ -323,6 +340,7 @@ function render() {
 
   bindEvents();
   mountEditor();
+  restoreTransientUiState();
   void loadActiveFile();
 }
 
@@ -580,6 +598,48 @@ function treeMenuItems(target: TreeMenuTarget) {
   ];
 }
 
+function renderChatThread(agent: AgentOption) {
+  const status = `${agent.available ? "Command detected in PATH." : "Command not detected yet."} ${
+    listenMode
+      ? `Voice-to-text will send to ${agent.label} using ${selectedModel} after a 5 second pause.`
+      : chatMode === "note"
+        ? "The active note will be attached to each request."
+        : "The open vault path and selected file list will be attached to each request."
+  }`;
+  const messages = chatMessages.length
+    ? chatMessages
+    : [
+        {
+          id: 0,
+          role: "assistant" as const,
+          label: agent.label,
+          content: status,
+        },
+      ];
+
+  return `
+    ${messages.map(renderChatMessage).join("")}
+    ${
+      agentIsRunning
+        ? `<article class="message assistant pending">
+            <span class="message-label">${escapeHtml(agent.label)}</span>
+            <p>Running ${escapeHtml(selectedModel)}...</p>
+          </article>`
+        : ""
+    }
+  `;
+}
+
+function renderChatMessage(message: ChatMessage) {
+  return `
+    <article class="message ${message.role}">
+      <span class="message-label">${escapeHtml(message.label)}</span>
+      ${message.meta ? `<span class="message-meta">${escapeHtml(message.meta)}</span>` : ""}
+      <p>${escapeHtml(message.content)}</p>
+    </article>
+  `;
+}
+
 function renderChatInput(agent: AgentOption) {
   if (listenMode && chatMode === "note") {
     return `
@@ -602,7 +662,7 @@ function renderChatInput(agent: AgentOption) {
       <label class="sr-only" for="agent-prompt">Message agent</label>
       <textarea id="agent-prompt" rows="3" placeholder="${
         chatMode === "note" ? "Ask about this note" : "Use @file and search/list/outline/section"
-      }"></textarea>
+      }" ${agentIsRunning ? "disabled" : ""}>${escapeHtml(chatDraft)}</textarea>
       <div class="prompt-actions">
         <div class="agent-controls" aria-label="Agent and model selection">
           <label>
@@ -634,7 +694,7 @@ function renderChatInput(agent: AgentOption) {
             </select>
           </label>
         </div>
-        <button type="submit">Send</button>
+        <button type="submit" ${agentIsRunning ? "disabled" : ""}>${agentIsRunning ? "Running" : "Send"}</button>
       </div>
     </form>
   `;
@@ -650,7 +710,9 @@ function renderFirstRun() {
           Choose the folder that contains your primary Markdown notes.
         </p>
         ${firstRunError ? `<p class="form-error">${firstRunError}</p>` : ""}
-        <button type="button" id="browse-vault">Browse</button>
+        <button type="button" id="browse-vault" ${isOpeningVault ? "disabled" : ""}>
+          ${isOpeningVault ? "Opening..." : "Browse"}
+        </button>
       </div>
     </section>
   `;
@@ -726,6 +788,10 @@ function renderOpenTab(path: string) {
 
 function bindEvents() {
   const tree = document.querySelector(".tree");
+
+  tree?.addEventListener("scroll", () => {
+    treeScrollTop = tree.scrollTop;
+  });
 
   tree?.addEventListener("mouseenter", (event) => {
     const mouseEvent = event as MouseEvent;
@@ -980,6 +1046,14 @@ function bindEvents() {
 
   document.querySelector<HTMLFormElement>(".prompt-box")?.addEventListener("submit", (event) => {
     event.preventDefault();
+    const prompt = document.querySelector<HTMLTextAreaElement>("#agent-prompt")?.value.trim() ?? "";
+    if (prompt) {
+      void sendAgentMessage(prompt);
+    }
+  });
+
+  document.querySelector<HTMLTextAreaElement>("#agent-prompt")?.addEventListener("input", (event) => {
+    chatDraft = (event.currentTarget as HTMLTextAreaElement).value;
   });
 
   document.querySelector<HTMLTextAreaElement>("#agent-prompt")?.addEventListener("keydown", (event) => {
@@ -1005,6 +1079,238 @@ function selectedEditorText() {
     .map((range) => editorView?.state.doc.sliceString(range.from, range.to) ?? "")
     .join("\n")
     .trim();
+}
+
+function captureTransientUiState() {
+  const prompt = document.querySelector<HTMLTextAreaElement>("#agent-prompt");
+  if (prompt) {
+    chatDraft = prompt.value;
+  }
+
+  const tree = document.querySelector<HTMLElement>(".tree");
+  if (tree) {
+    treeScrollTop = tree.scrollTop;
+  }
+}
+
+function restoreTransientUiState() {
+  const tree = document.querySelector<HTMLElement>(".tree");
+  if (tree) {
+    tree.scrollTop = treeScrollTop;
+  }
+}
+
+async function sendAgentMessage(message: string) {
+  if (agentIsRunning) {
+    return;
+  }
+
+  persistEditorText();
+  const agent = activeAgent();
+  const requestFile = activeFile;
+  chatDraft = "";
+  pushChatMessage({
+    role: "user",
+    label: "You",
+    content: message,
+    meta: chatMode === "note" ? `Note: ${requestFile}` : `Path: ${currentVaultPath ?? "No vault"}`,
+  });
+  agentIsRunning = true;
+  render();
+
+  try {
+    const response = await invoke<AgentRunResponse>("run_agent_headless", {
+      request: {
+        agent: selectedAgent,
+        model: selectedModel,
+        prompt: buildAgentPrompt(message, requestFile),
+      },
+    });
+    const output = response.stdout || response.stderr || "(no output)";
+    const update = parseModelUpdate(output);
+    if (update) {
+      const result = applyModelUpdate(requestFile, update);
+      pushChatMessage({
+        role: "assistant",
+        label: agent.label,
+        content: result.message,
+        meta: `${response.model} applied ${update.position}`,
+      });
+    } else {
+      pushChatMessage({
+        role: "assistant",
+        label: agent.label,
+        content: output,
+        meta: `${response.model} via ${response.command}`,
+      });
+    }
+  } catch (error) {
+    pushChatMessage({
+      role: "assistant",
+      label: agent.label,
+      content: error instanceof Error ? error.message : String(error),
+      meta: "Headless run failed",
+    });
+  } finally {
+    agentIsRunning = false;
+    render();
+  }
+}
+
+function pushChatMessage(message: Omit<ChatMessage, "id">) {
+  chatMessages = [...chatMessages, {id: nextChatMessageId, ...message}].slice(-30);
+  nextChatMessageId += 1;
+}
+
+function buildAgentPrompt(message: string, requestFile = activeFile) {
+  const history = chatMessages
+    .slice(-8)
+    .map((entry) => `${entry.label}: ${entry.content}`)
+    .join("\n\n");
+  const context =
+    chatMode === "note"
+      ? `Mode: Note
+Active note: ${requestFile}
+
+<active_note>
+${noteText(requestFile)}
+</active_note>
+
+<active_note_lines>
+${numberedNoteText(requestFile)}
+</active_note_lines>`
+      : `Mode: Path
+Vault path: ${currentVaultPath ?? "No vault selected"}
+Active folder: ${activeFolder}
+Active file: ${activeFile}
+
+<visible_files>
+${visiblePathSummary()}
+</visible_files>`;
+
+  return `<persona>
+You are an elite-level editor who helps the user with note taking, rewriting, structure, and reorganization of Markdown content.
+</persona>
+
+<instructions>
+You are running inside Noted, a local Markdown note app. Use the provided context to help the user work with local Markdown notes.
+
+Operating rules:
+- In Note mode, treat the active note as the primary document.
+- In Path mode, reason across the visible vault paths and ask for specific @file contents when needed.
+- You may request edits by starting your response with an update control block. If you do this, the update block must be the first non-whitespace text in your response.
+- To replace the full active note, respond exactly in this shape:
+<update><position>replace-all</position><content>
+FULL REPLACEMENT MARKDOWN
+</content></update>
+- To replace specific 1-based inclusive lines from <active_note_lines>, respond exactly in this shape:
+<update><position>replace,33-48</position><content>
+REPLACEMENT MARKDOWN FOR THOSE LINES
+</content></update>
+- You may also use insert-before,N, insert-after,N, and append as the <position> value.
+- If you use an update block, do not include a conversational preface before it. Text after </update> is allowed as a short note to the user.
+- Preserve Markdown structure, headings, links, tasks, and code fences unless the user asks you to change them.
+- If a request is ambiguous, ask one concise clarification instead of guessing.
+- Keep responses focused on the current note/vault context.
+</instructions>
+
+${context}
+
+<chat_history>
+${history || "No previous messages."}
+</chat_history>
+
+<user_request>
+${message}
+</user_request>`;
+}
+
+function visiblePathSummary() {
+  return folders
+    .map((folder) => {
+      const files = markdownFiles(folder)
+        .slice(0, 40)
+        .map((file) => `  - ${file.path}`)
+        .join("\n");
+      return `${folder.path}\n${files || "  (empty)"}`;
+    })
+    .join("\n");
+}
+
+function numberedNoteText(path: string) {
+  return noteText(path)
+    .split("\n")
+    .map((line, index) => `${String(index + 1).padStart(4, " ")} | ${line}`)
+    .join("\n");
+}
+
+function parseModelUpdate(output: string): ModelUpdate | null {
+  const trimmed = output.trimStart();
+  if (!trimmed.startsWith("<update>")) {
+    return null;
+  }
+
+  const position = trimmed.match(/<position>([\s\S]*?)<\/position>/)?.[1]?.trim();
+  const content = trimmed.match(/<content>\n?([\s\S]*?)\n?<\/content>/)?.[1];
+  if (!position || content === undefined) {
+    return null;
+  }
+
+  return {position, content};
+}
+
+function applyModelUpdate(path: string, update: ModelUpdate) {
+  const current = noteText(path);
+  const next = applyModelUpdateToText(current, update);
+  noteTexts.set(path, next);
+  dirtyFiles.add(path);
+
+  if (path === activeFile && editorView) {
+    editorView.dispatch({
+      changes: {from: 0, to: editorView.state.doc.length, insert: next},
+    });
+  } else {
+    scheduleSave(path, next);
+  }
+
+  return {
+    message: `Applied model update to ${path} (${update.position}).`,
+  };
+}
+
+function applyModelUpdateToText(current: string, update: ModelUpdate) {
+  const position = update.position.trim().toLowerCase();
+  if (position === "replace-all") {
+    return update.content;
+  }
+  if (position === "append") {
+    return `${current.replace(/\s*$/, "")}\n\n${update.content}`;
+  }
+
+  const lines = current.split("\n");
+  const replace = position.match(/^replace,(\d+)-(\d+)$/);
+  if (replace) {
+    const start = Math.max(1, Number(replace[1]));
+    const end = Math.max(start, Number(replace[2]));
+    lines.splice(start - 1, end - start + 1, ...update.content.split("\n"));
+    return lines.join("\n");
+  }
+
+  const insertBefore = position.match(/^insert-before,(\d+)$/);
+  if (insertBefore) {
+    const line = Math.max(1, Number(insertBefore[1]));
+    lines.splice(line - 1, 0, ...update.content.split("\n"));
+    return lines.join("\n");
+  }
+
+  const insertAfter = position.match(/^insert-after,(\d+)$/);
+  if (insertAfter) {
+    const line = Math.max(1, Number(insertAfter[1]));
+    lines.splice(line, 0, ...update.content.split("\n"));
+    return lines.join("\n");
+  }
+
+  throw new Error(`Unsupported update position: ${update.position}`);
 }
 
 function persistEditorText() {
@@ -1735,6 +2041,15 @@ async function loadVaultConfig() {
 }
 
 async function browseForVault() {
+  if (isOpeningVault) {
+    return;
+  }
+
+  isOpeningVault = true;
+  firstRunError = null;
+  indexSummary = "Opening vault...";
+  render();
+
   let selected: string | null | string[] = null;
   try {
     selected = await open({
@@ -1743,10 +2058,15 @@ async function browseForVault() {
       title: "Select your main notes folder",
     });
   } catch {
-    selected = await browseForVaultInBrowser();
+    firstRunError = await browseForVaultInBrowser();
+    isOpeningVault = false;
+    render();
+    return;
   }
 
   if (typeof selected !== "string") {
+    isOpeningVault = false;
+    render();
     return;
   }
 
@@ -1756,29 +2076,29 @@ async function browseForVault() {
     configPath = opened.configPath;
     indexSummary = `${opened.documents} files, ${opened.updated} updated`;
     await loadVaultTree(opened.vault);
+    firstRun = false;
   } catch {
-    currentVaultPath = selected;
-    indexSummary = "Browser preview";
+    firstRunError = "That folder could not be opened. Launch Noted through the desktop shell and select a local filesystem folder.";
+    indexSummary = "Open failed";
+  } finally {
+    isOpeningVault = false;
   }
 
-  firstRun = false;
   render();
 }
 
 async function browseForVaultInBrowser() {
   const picker = window as BrowserDirectoryPicker;
   if (!picker.showDirectoryPicker) {
-    firstRunError = "Open the desktop app to use the operating system folder picker.";
-    render();
-    return null;
+    return "Open the desktop app to use the operating system folder picker.";
   }
 
-  const directory = await picker.showDirectoryPicker();
-  return directory.name;
+  await picker.showDirectoryPicker();
+  return "Browser preview can choose a directory, but it cannot provide the full local path Noted needs. Open the desktop app to connect your notes folder.";
 }
 
-async function loadVaultTree(path: string) {
-  const nextFolders = await invoke<FolderNode[]>("list_vault_tree", {path});
+async function loadVaultTree(path?: string) {
+  const nextFolders = await invoke<FolderNode[]>("list_vault_tree", {path: path ?? null});
   if (!nextFolders.length) {
     return;
   }

@@ -1,6 +1,8 @@
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use noted_core::{NotedConfig, PersistentIndex, config_path};
 
@@ -265,6 +267,13 @@ fn write_vault_file(relative_path: String, content: String) -> Result<FileWriteS
     })
 }
 
+#[tauri::command]
+async fn run_agent_headless(request: AgentRunRequest) -> Result<AgentRunResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || run_agent_headless_blocking(request))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
 #[derive(serde::Serialize)]
 struct AgentCommand {
     command: String,
@@ -326,6 +335,141 @@ struct FileContentState {
 struct FileWriteState {
     path: String,
     bytes: usize,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentRunRequest {
+    agent: String,
+    model: String,
+    prompt: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentRunResponse {
+    agent: String,
+    model: String,
+    command: String,
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+}
+
+fn run_agent_headless_blocking(request: AgentRunRequest) -> Result<AgentRunResponse, String> {
+    if request.prompt.trim().is_empty() {
+        return Err("prompt is empty".to_owned());
+    }
+    if !matches!(request.agent.as_str(), "codex" | "gemini" | "claude") {
+        return Err(format!("unsupported agent: {}", request.agent));
+    }
+    if !command_exists(&request.agent) {
+        return Err(format!("{} was not found in PATH", request.agent));
+    }
+
+    let root = configured_vault().ok();
+    let mut command = Command::new(&request.agent);
+    if let Some(root) = root.as_ref() {
+        command.current_dir(root);
+    }
+
+    let write_prompt_to_stdin = request.agent != "codex";
+    let args = agent_headless_args(
+        &request.agent,
+        &request.model,
+        root.as_deref(),
+        &request.prompt,
+    );
+    command.args(&args);
+    if write_prompt_to_stdin {
+        command.stdin(Stdio::piped());
+    }
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    if write_prompt_to_stdin && let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(request.prompt.as_bytes())
+            .map_err(|error| error.to_string())?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| error.to_string())?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if !output.status.success() {
+        return Err(if stderr.is_empty() {
+            format!(
+                "{} exited with status {:?}",
+                request.agent,
+                output.status.code()
+            )
+        } else {
+            stderr
+        });
+    }
+
+    Ok(AgentRunResponse {
+        command: format!("{} {}", request.agent, args.join(" ")),
+        agent: request.agent,
+        model: request.model,
+        stdout,
+        stderr,
+        exit_code: output.status.code(),
+    })
+}
+
+fn agent_headless_args(agent: &str, model: &str, root: Option<&Path>, prompt: &str) -> Vec<String> {
+    match agent {
+        "codex" => {
+            let mut args = Vec::new();
+            push_model_args(&mut args, model);
+            args.extend(["exec".to_owned(), "--ephemeral".to_owned()]);
+            if let Some(root) = root {
+                args.extend([
+                    "--cd".to_owned(),
+                    root.display().to_string(),
+                    "--skip-git-repo-check".to_owned(),
+                ]);
+            }
+            args.push(prompt.to_owned());
+            args
+        }
+        "claude" => {
+            let mut args = vec!["--print".to_owned()];
+            push_model_args(&mut args, model);
+            args.extend([
+                "--output-format".to_owned(),
+                "text".to_owned(),
+                "--no-session-persistence".to_owned(),
+                "--permission-mode".to_owned(),
+                "plan".to_owned(),
+            ]);
+            args
+        }
+        "gemini" => {
+            let mut args = Vec::new();
+            push_model_args(&mut args, model);
+            args.extend([
+                "--prompt".to_owned(),
+                "Respond to the Noted request using the context provided on stdin.".to_owned(),
+                "--output-format".to_owned(),
+                "text".to_owned(),
+                "--approval-mode".to_owned(),
+                "plan".to_owned(),
+            ]);
+            args
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn push_model_args(args: &mut Vec<String>, model: &str) {
+    if model != "default" {
+        args.extend(["--model".to_owned(), model.to_owned()]);
+    }
 }
 
 fn command_exists(command: &str) -> bool {
@@ -610,7 +754,8 @@ pub fn run() {
             duplicate_vault_path,
             paste_vault_path,
             read_vault_file,
-            write_vault_file
+            write_vault_file,
+            run_agent_headless
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Noted desktop application");
