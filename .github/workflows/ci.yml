@@ -62,14 +62,21 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          - name: macOS
+          - name: macOS (Apple Silicon)
             os: macos-latest
-            args: --bundles app
+            target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin --bundles dmg
+          - name: macOS (Intel)
+            os: macos-13
+            target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin --bundles dmg
           - name: Windows
             os: windows-latest
+            target: ""
             args: --bundles nsis
           - name: Linux
             os: ubuntu-22.04
+            target: ""
             args: --bundles deb,appimage
     runs-on: ${{ matrix.platform.os }}
 
@@ -85,6 +92,8 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -118,6 +127,22 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS code signing + notarization (no-ops on Linux/Windows runners).
+          # Required GitHub repo secrets:
+          #   APPLE_CERTIFICATE              - base64 of Developer ID Application .p12
+          #   APPLE_CERTIFICATE_PASSWORD     - password for that .p12
+          #   APPLE_SIGNING_IDENTITY         - "Developer ID Application: Name (TEAMID)"
+          #   APPLE_ID                       - Apple ID email
+          #   APPLE_PASSWORD                 - app-specific password for that Apple ID
+          #   APPLE_TEAM_ID                  - 10-char Apple developer team ID
+          #   KEYCHAIN_PASSWORD              - any random string (temp keychain pw)
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         with:
           projectPath: apps/noted-desktop
           args: ${{ matrix.platform.args }}

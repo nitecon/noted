@@ -63,6 +63,18 @@ npm install
 npm run dev
 ```
 
+## Downloads
+
+Tagged releases (`v*`) publish desktop builds to the
+[GitHub Releases page](https://github.com/nitecon/noted/releases):
+
+- **macOS (Apple Silicon)**: `Noted_<version>_aarch64.dmg`
+- **macOS (Intel)**: `Noted_<version>_x64.dmg`
+- **Windows**: `Noted_<version>_x64-setup.exe`
+- **Linux**: `Noted_<version>_amd64.AppImage` or `.deb`
+
+Open the macOS DMG, drag **Noted.app** to **Applications**, and launch it.
+
 ## Workspace
 
 - `crates/noted-core`: Markdown parsing, section extraction, and vault search.
