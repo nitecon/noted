@@ -163,8 +163,8 @@ jobs:
         with:
           projectPath: apps/noted-desktop
           args: ${{ matrix.platform.args }}
-          releaseAssetNamePattern: noted_[platform]_[arch]_[version][ext]
-          uploadUpdaterJson: true
+          assetNamePattern: noted_[platform]_[arch]_[version][ext]
+          includeUpdaterJson: true
           updaterJsonPreferNsis: true
           tagName: ${{ github.ref_name }}
           releaseName: Noted ${{ github.ref_name }}
