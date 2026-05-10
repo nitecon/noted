@@ -114,12 +114,25 @@ jobs:
           const version = process.env.VERSION.replace(/^v/, "");
           const updates = [
             "apps/noted-desktop/package.json",
+            "apps/noted-desktop/package-lock.json",
             "apps/noted-desktop/src-tauri/tauri.conf.json",
           ];
           for (const path of updates) {
             const data = JSON.parse(fs.readFileSync(path, "utf8"));
             data.version = version;
+            if (data.packages?.[""]) {
+              data.packages[""].version = version;
+            }
             fs.writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`);
+          }
+          const cargoManifests = [
+            "apps/noted-desktop/src-tauri/Cargo.toml",
+            "crates/noted-cli/Cargo.toml",
+            "crates/noted-core/Cargo.toml",
+          ];
+          for (const path of cargoManifests) {
+            const cargo = fs.readFileSync(path, "utf8");
+            fs.writeFileSync(path, cargo.replace(/^version = ".*"$/m, `version = "${version}"`));
           }
           NODE
 
@@ -136,6 +149,8 @@ jobs:
           #   APPLE_PASSWORD                 - app-specific password for that Apple ID
           #   APPLE_TEAM_ID                  - 10-char Apple developer team ID
           #   KEYCHAIN_PASSWORD              - any random string (temp keychain pw)
+          #   TAURI_SIGNING_PRIVATE_KEY      - private updater key from `tauri signer generate`
+          #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD - updater key password, if one was set
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -143,9 +158,13 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: apps/noted-desktop
           args: ${{ matrix.platform.args }}
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
           tagName: ${{ github.ref_name }}
           releaseName: Noted ${{ github.ref_name }}
           releaseBody: Desktop builds for Noted ${{ github.ref_name }}.

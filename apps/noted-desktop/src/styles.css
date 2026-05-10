@@ -311,6 +311,16 @@ h2 {
   gap: 3px;
 }
 
+.vault-footer .update-footer {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 8px;
+}
+
+.vault-footer .update-footer span {
+  grid-column: 1 / -1;
+}
+
 .vault-footer span {
   color: #6b7b71;
   font-size: 0.68rem;
@@ -325,6 +335,29 @@ h2 {
   font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.update-status.checking,
+.update-status.downloading {
+  color: #325c85;
+}
+
+.update-status.ready {
+  color: #1f6b46;
+}
+
+.update-status.error {
+  color: #9a432c;
+}
+
+.update-restart {
+  min-height: 26px;
+  border: 1px solid #aebbb4;
+  border-radius: 5px;
+  background: #ffffff;
+  color: #24352c;
+  padding: 0 8px;
+  font-size: 0.72rem;
 }
 
 .tree-item,

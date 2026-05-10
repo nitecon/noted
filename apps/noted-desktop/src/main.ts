@@ -1,5 +1,8 @@
+import {getVersion} from "@tauri-apps/api/app";
 import {invoke} from "@tauri-apps/api/core";
 import {open} from "@tauri-apps/plugin-dialog";
+import {relaunch} from "@tauri-apps/plugin-process";
+import {check} from "@tauri-apps/plugin-updater";
 import {defaultKeymap, history, historyKeymap} from "@codemirror/commands";
 import {markdown} from "@codemirror/lang-markdown";
 import {defaultHighlightStyle, syntaxHighlighting} from "@codemirror/language";
@@ -123,7 +126,16 @@ type PendingMove = {
   targetFolderPath: string;
 };
 
+type UpdateState =
+  | {status: "idle"; label: string}
+  | {status: "checking"; label: string}
+  | {status: "downloading"; label: string; progress: number | null}
+  | {status: "ready"; label: string; version: string}
+  | {status: "error"; label: string};
+
 const idleRenderDelayMs = 20_000;
+const updateCheckIntervalMs = 60 * 60 * 1000;
+const updateCheckStorageKey = "noted.lastUpdateCheck";
 
 const md = new MarkdownIt({
   breaks: true,
@@ -228,7 +240,8 @@ const saveTimers = new Map<string, number>();
 const noteUndoStacks = new Map<string, string[]>();
 const noteRedoStacks = new Map<string, string[]>();
 let suppressNextSave = false;
-const notedVersion = "0.0.0-source";
+let notedVersion = "0.0.0-dev";
+let updateState: UpdateState = {status: "idle", label: "Idle"};
 
 const app = document.querySelector<HTMLDivElement>("#app");
 
@@ -295,6 +308,10 @@ function render() {
             <span>Index</span>
             <strong id="index-summary">${indexSummary}</strong>
           </div>
+          <div class="update-footer">
+            <span>Updates</span>
+            ${renderUpdaterStatus()}
+          </div>
         </footer>
       </aside>
 
@@ -359,6 +376,22 @@ function render() {
   mountEditor();
   restoreTransientUiState();
   void loadActiveFile();
+}
+
+function renderUpdaterStatus() {
+  const detail =
+    updateState.status === "downloading" && updateState.progress !== null
+      ? `${updateState.label} ${Math.round(updateState.progress * 100)}%`
+      : updateState.label;
+
+  return `
+    <strong class="update-status ${updateState.status}">${escapeHtml(detail)}</strong>
+    ${
+      updateState.status === "ready"
+        ? `<button type="button" class="update-restart" id="restart-update">Restart</button>`
+        : ""
+    }
+  `;
 }
 
 function renderVoiceMenu() {
@@ -1661,6 +1694,10 @@ function bindEvents() {
   document.querySelector<HTMLButtonElement>("#browse-vault")?.addEventListener("click", async () => {
     await browseForVault();
   });
+
+  document.querySelector<HTMLButtonElement>("#restart-update")?.addEventListener("click", async () => {
+    await relaunch();
+  });
 }
 
 function selectedEditorText() {
@@ -2747,6 +2784,74 @@ async function detectAgents() {
   render();
 }
 
+async function loadAppVersion() {
+  try {
+    notedVersion = await getVersion();
+  } catch {
+    notedVersion = "0.0.0-dev";
+  }
+
+  render();
+}
+
+async function checkForAppUpdate() {
+  if (!shouldCheckForUpdate()) {
+    updateState = {status: "idle", label: "Recent"};
+    render();
+    return;
+  }
+
+  updateState = {status: "checking", label: "Checking"};
+  render();
+
+  try {
+    const update = await check();
+    markUpdateChecked();
+
+    if (!update) {
+      updateState = {status: "idle", label: "Current"};
+      render();
+      return;
+    }
+
+    let downloaded = 0;
+    let contentLength = 0;
+    updateState = {status: "downloading", label: `Downloading ${update.version}`, progress: null};
+    render();
+
+    await update.downloadAndInstall((event) => {
+      if (event.event === "Started") {
+        downloaded = 0;
+        contentLength = event.data.contentLength ?? 0;
+      } else if (event.event === "Progress") {
+        downloaded += event.data.chunkLength;
+      }
+
+      updateState = {
+        status: "downloading",
+        label: `Downloading ${update.version}`,
+        progress: contentLength > 0 ? downloaded / contentLength : null,
+      };
+      render();
+    });
+
+    updateState = {status: "ready", label: `${update.version} ready`, version: update.version};
+    render();
+  } catch {
+    updateState = {status: "error", label: "Check failed"};
+    render();
+  }
+}
+
+function shouldCheckForUpdate() {
+  const lastCheck = Number(window.localStorage.getItem(updateCheckStorageKey) ?? 0);
+  return !Number.isFinite(lastCheck) || Date.now() - lastCheck > updateCheckIntervalMs;
+}
+
+function markUpdateChecked() {
+  window.localStorage.setItem(updateCheckStorageKey, String(Date.now()));
+}
+
 async function loadVaultConfig() {
   try {
     const state = await invoke<VaultConfigState>("get_vault_config");
@@ -2841,8 +2946,10 @@ async function refreshVaultTree() {
 }
 
 render();
+loadAppVersion();
 loadVaultConfig();
 detectAgents();
+checkForAppUpdate();
 
 window.addEventListener("keydown", (event) => {
   const target = event.target as HTMLElement | null;
