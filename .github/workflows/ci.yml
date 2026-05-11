@@ -58,6 +58,7 @@ jobs:
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     permissions:
       contents: write
+    continue-on-error: ${{ startsWith(matrix.platform.name, 'macOS') }}
     strategy:
       fail-fast: false
       matrix:
