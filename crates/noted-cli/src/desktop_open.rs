@@ -25,14 +25,20 @@ fn open_path(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let status = Command::new("open")
         .arg("-a")
         .arg("Noted")
-        .arg("--args")
         .arg(path)
-        .status()?;
+        .status()
+        .or_else(|_| {
+            Command::new("open")
+                .arg("-a")
+                .arg("/Applications/Noted.app")
+                .arg(path)
+                .status()
+        })?;
 
     if status.success() {
         Ok(())
     } else {
-        Err("failed to launch Noted with `open -a Noted`".into())
+        Err(format!("failed to open {} in Noted", path.display()).into())
     }
 }
 

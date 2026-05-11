@@ -284,6 +284,11 @@ fn take_pending_open_target(
     pending.take()
 }
 
+#[tauri::command]
+fn resolve_open_target(path: String) -> Result<os_open::OpenTarget, String> {
+    os_open::target_from_user_path(&path).ok_or_else(|| format!("could not open {path}"))
+}
+
 #[derive(serde::Serialize)]
 struct AgentCommand {
     command: String,
@@ -783,7 +788,8 @@ pub fn run() {
             read_vault_file,
             write_vault_file,
             run_agent_headless,
-            take_pending_open_target
+            take_pending_open_target,
+            resolve_open_target
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Noted desktop application")

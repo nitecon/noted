@@ -283,7 +283,11 @@ function render() {
             <p class="eyebrow">Vault</p>
             <h1>Noted</h1>
           </div>
-          <button class="icon-button" type="button" aria-label="Create note">+</button>
+          <div class="pane-actions" aria-label="Vault actions">
+            <button class="open-action" type="button" id="open-folder">Folder</button>
+            <button class="open-action" type="button" id="open-file">File</button>
+            <button class="icon-button" type="button" aria-label="Create note" title="Create note">+</button>
+          </div>
         </header>
 
         <label class="search-box">
@@ -1701,6 +1705,14 @@ function bindEvents() {
     await browseForVault();
   });
 
+  document.querySelector<HTMLButtonElement>("#open-folder")?.addEventListener("click", async () => {
+    await browseForVault();
+  });
+
+  document.querySelector<HTMLButtonElement>("#open-file")?.addEventListener("click", async () => {
+    await openMarkdownFile();
+  });
+
   document.querySelector<HTMLButtonElement>("#restart-update")?.addEventListener("click", async () => {
     await relaunch();
   });
@@ -2897,6 +2909,43 @@ async function applyOpenTarget(target: OpenTarget) {
   }
 
   render();
+}
+
+async function openMarkdownFile() {
+  if (isOpeningVault) {
+    return;
+  }
+
+  isOpeningVault = true;
+  indexSummary = "Opening file...";
+  render();
+
+  try {
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      filters: [
+        {
+          name: "Markdown",
+          extensions: ["md", "markdown"],
+        },
+      ],
+    });
+    if (typeof selected !== "string") {
+      isOpeningVault = false;
+      render();
+      return;
+    }
+
+    const target = await invoke<OpenTarget>("resolve_open_target", {path: selected});
+    await applyOpenTarget(target);
+  } catch (error) {
+    firstRunError = `That file could not be opened: ${error instanceof Error ? error.message : String(error)}`;
+    indexSummary = "Open failed";
+  } finally {
+    isOpeningVault = false;
+    render();
+  }
 }
 
 async function browseForVault() {

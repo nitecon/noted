@@ -57,6 +57,10 @@ pub fn target_from_opened_urls(urls: Vec<Url>) -> Option<OpenTarget> {
     target_from_paths(paths)
 }
 
+pub fn target_from_user_path(path: &str) -> Option<OpenTarget> {
+    target_from_paths(vec![PathBuf::from(path)])
+}
+
 pub fn emit_open_target(app: &AppHandle, target: OpenTarget) {
     if app.emit(OPEN_TARGET_EVENT, target.clone()).is_err() {
         app.state::<PendingOpenTarget>().set(target);
