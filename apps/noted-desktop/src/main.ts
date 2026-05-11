@@ -1,5 +1,6 @@
 import {getVersion} from "@tauri-apps/api/app";
 import {invoke} from "@tauri-apps/api/core";
+import {listen} from "@tauri-apps/api/event";
 import {open} from "@tauri-apps/plugin-dialog";
 import {relaunch} from "@tauri-apps/plugin-process";
 import {check} from "@tauri-apps/plugin-updater";
@@ -53,6 +54,11 @@ type DetectedCommand = {
 type VaultConfigState = {
   configPath: string;
   vault: string | null;
+};
+
+type OpenTarget = {
+  vault: string;
+  file: string | null;
 };
 
 type VaultOpenState = {
@@ -2854,16 +2860,40 @@ function markUpdateChecked() {
 
 async function loadVaultConfig() {
   try {
+    const openTarget = await invoke<OpenTarget | null>("take_pending_open_target");
     const state = await invoke<VaultConfigState>("get_vault_config");
     configPath = state.configPath;
-    currentVaultPath = state.vault;
-    firstRun = !state.vault;
-    if (state.vault) {
-      await loadVaultTree(state.vault);
+    if (openTarget) {
+      await applyOpenTarget(openTarget);
+    } else {
+      currentVaultPath = state.vault;
+      firstRun = !state.vault;
+      if (state.vault) {
+        await loadVaultTree(state.vault);
+      }
     }
   } catch {
     currentVaultPath = null;
     firstRun = true;
+  }
+
+  render();
+}
+
+async function applyOpenTarget(target: OpenTarget) {
+  try {
+    const opened = await invoke<VaultOpenState>("set_vault_path", {path: target.vault});
+    currentVaultPath = opened.vault;
+    configPath = opened.configPath;
+    indexSummary = `${opened.documents} files, ${opened.updated} updated`;
+    await loadVaultTree(opened.vault, target.file ?? undefined);
+    firstRun = false;
+    firstRunError = null;
+  } catch (error) {
+    firstRunError = `Could not open ${target.file ?? target.vault}: ${
+      error instanceof Error ? error.message : String(error)
+    }`;
+    indexSummary = "Open failed";
   }
 
   render();
@@ -2926,7 +2956,7 @@ async function browseForVaultInBrowser() {
   return "Browser preview can choose a directory, but it cannot provide the full local path Noted needs. Open the desktop app to connect your notes folder.";
 }
 
-async function loadVaultTree(path?: string) {
+async function loadVaultTree(path?: string, preferredFile?: string) {
   const nextFolders = await invoke<FolderNode[]>("list_vault_tree", {path: path ?? null});
   if (!nextFolders.length) {
     return;
@@ -2934,8 +2964,13 @@ async function loadVaultTree(path?: string) {
 
   folders = nextFolders;
   expandedFolders = new Set(folders.map((folder) => folder.path));
-  activeFolder = folders[0]?.path ?? "";
-  activeFile = folders.flatMap((folder) => markdownFiles(folder))[0]?.path ?? folders[0]?.files[0]?.path ?? "";
+  const allFiles = folders.flatMap((folder) => folder.files);
+  activeFile =
+    (preferredFile && allFiles.find((file) => file.path === preferredFile)?.path) ||
+    folders.flatMap((folder) => markdownFiles(folder))[0]?.path ||
+    folders[0]?.files[0]?.path ||
+    "";
+  activeFolder = folderForFile(activeFile) ?? folders[0]?.path ?? "";
   openFiles = activeFile ? [activeFile] : [];
 }
 
@@ -2950,6 +2985,9 @@ loadAppVersion();
 loadVaultConfig();
 detectAgents();
 checkForAppUpdate();
+listen<OpenTarget>("open-target", (event) => {
+  void applyOpenTarget(event.payload);
+});
 
 window.addEventListener("keydown", (event) => {
   const target = event.target as HTMLElement | null;

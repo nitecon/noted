@@ -7,6 +7,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::process;
 
+mod desktop_open;
+
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
         eprintln!("error: {error}");
@@ -32,21 +34,8 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn open_vault_command(path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-    let config = NotedConfig::load()?;
-    let vault = config.resolve_vault(path)?;
-    let update = PersistentIndex::refresh(&vault)?;
-    let stats = update.index.stats();
-
-    println!("vault: {}", vault.display());
-    println!("index: {}", update.manifest_path.display());
-    println!("documents: {}", stats.documents);
-    println!(
-        "scan: {} files, {} reused, {} updated, {} removed",
-        update.scanned, update.reused, update.updated, update.removed
-    );
-    println!("desktop: launch integration pending; use `cd apps/noted-desktop && npm run dev`");
-
-    Ok(())
+    let path = path.map(PathBuf::from);
+    desktop_open::open_in_desktop(path.as_deref())
 }
 
 fn search_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -237,6 +226,6 @@ fn section_command(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn print_help() {
     println!(
-        "noted\n\nUSAGE:\n  noted [vault]\n  noted config show\n  noted config set-vault <path>\n  noted index [vault] [--refresh|--rebuild]\n  noted search <query> [vault] [--limit n] [--mode bm25|vector]\n  noted outline <note.md>\n  noted section <note.md> <heading>"
+        "noted\n\nUSAGE:\n  noted [path]\n  noted config show\n  noted config set-vault <path>\n  noted index [vault] [--refresh|--rebuild]\n  noted search <query> [vault] [--limit n] [--mode bm25|vector]\n  noted outline <note.md>\n  noted section <note.md> <heading>"
     );
 }

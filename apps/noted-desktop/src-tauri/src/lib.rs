@@ -5,6 +5,9 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use noted_core::{NotedConfig, PersistentIndex, config_path};
+use tauri::Manager;
+
+mod os_open;
 
 #[tauri::command]
 fn detect_agent_commands() -> Vec<AgentCommand> {
@@ -272,6 +275,13 @@ async fn run_agent_headless(request: AgentRunRequest) -> Result<AgentRunResponse
     tauri::async_runtime::spawn_blocking(move || run_agent_headless_blocking(request))
         .await
         .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn take_pending_open_target(
+    pending: tauri::State<'_, os_open::PendingOpenTarget>,
+) -> Option<os_open::OpenTarget> {
+    pending.take()
 }
 
 #[derive(serde::Serialize)]
@@ -738,7 +748,22 @@ fn is_ignored_directory(path: &Path) -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let startup_target = os_open::startup_target();
+
     tauri::Builder::default()
+        .manage(os_open::PendingOpenTarget::default())
+        .setup(move |app| {
+            let _ = os_open::ensure_os_open_integration(app.handle());
+            if let Some(target) = startup_target.clone() {
+                app.state::<os_open::PendingOpenTarget>().set(target);
+            }
+            Ok(())
+        })
+        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            if let Some(target) = os_open::target_from_single_instance(args, cwd) {
+                os_open::emit_open_target(app, target);
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -757,8 +782,16 @@ pub fn run() {
             paste_vault_path,
             read_vault_file,
             write_vault_file,
-            run_agent_headless
+            run_agent_headless,
+            take_pending_open_target
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run Noted desktop application");
+        .build(tauri::generate_context!())
+        .expect("failed to build Noted desktop application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Opened { urls } = event
+                && let Some(target) = os_open::target_from_opened_urls(urls)
+            {
+                os_open::emit_open_target(app, target);
+            }
+        });
 }
