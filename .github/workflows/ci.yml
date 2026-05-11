@@ -58,7 +58,6 @@ jobs:
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     permissions:
       contents: write
-    continue-on-error: ${{ startsWith(matrix.platform.name, 'macOS') }}
     strategy:
       fail-fast: false
       matrix:
@@ -141,7 +140,10 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # macOS code signing + notarization (no-ops on Linux/Windows runners).
+          # Temporary macOS ad-hoc signing for pipeline/test builds while Apple notarization is blocked.
+          # Ad-hoc signed macOS builds are not notarized; users may need Privacy & Security approval.
+          APPLE_SIGNING_IDENTITY: ${{ runner.os == 'macOS' && '-' || '' }}
+          # Production macOS code signing + notarization (currently disabled).
           # Required GitHub repo secrets:
           #   APPLE_CERTIFICATE              - base64 of Developer ID Application .p12
           #   APPLE_CERTIFICATE_PASSWORD     - password for that .p12
@@ -152,20 +154,20 @@ jobs:
           #   KEYCHAIN_PASSWORD              - any random string (temp keychain pw)
           #   TAURI_SIGNING_PRIVATE_KEY      - private updater key from `tauri signer generate`
           #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD - updater key password, if one was set
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # APPLE_ID: ${{ secrets.APPLE_ID }}
+          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          # TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: apps/noted-desktop
           args: ${{ matrix.platform.args }}
           assetNamePattern: noted_[platform]_[arch]_[version][ext]
-          includeUpdaterJson: true
+          includeUpdaterJson: false
           updaterJsonPreferNsis: true
           tagName: ${{ github.ref_name }}
           releaseName: Noted ${{ github.ref_name }}
